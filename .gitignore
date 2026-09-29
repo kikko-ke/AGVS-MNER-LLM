@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 训练产物
+outputs/
+outputs_llm/
+teacher_cache/
+checkpoints/
+*.log
+
+# 数据集（大数据，不入库）
+dataset/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
