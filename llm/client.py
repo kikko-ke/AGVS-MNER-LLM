@@ -21,11 +21,13 @@ class LLMTeacherClient:
         api_key: str | None = None,
         model: str | None = None,
         timeout: int = 120,
+        max_tokens: int = 1024,
     ) -> None:
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "")).rstrip("/")
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "")
         self.timeout = timeout
+        self.max_tokens = max_tokens
         if not self.base_url or not self.model:
             raise ValueError("base_url and model are required")
         self.endpoint = (
@@ -64,6 +66,7 @@ class LLMTeacherClient:
         request_body = {
             "model": self.model,
             "temperature": 0.0,
+            "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
