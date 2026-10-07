@@ -6,6 +6,8 @@ import base64
 import json
 import mimetypes
 import os
+import random
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -22,12 +24,18 @@ class LLMTeacherClient:
         model: str | None = None,
         timeout: int = 120,
         max_tokens: int = 1024,
+        max_retries: int = 5,
+        retry_base_delay: float = 2.0,
     ) -> None:
         self.base_url = (base_url or os.environ.get("LLM_BASE_URL", "")).rstrip("/")
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "")
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        if max_retries < 0 or retry_base_delay < 0:
+            raise ValueError("max_retries and retry_base_delay must be non-negative")
         if not self.base_url or not self.model:
             raise ValueError("base_url and model are required")
         self.endpoint = (
@@ -60,13 +68,20 @@ class LLMTeacherClient:
         for path in image_paths:
             if path and path.exists():
                 user_content.append(
-                    {"type": "image_url", "image_url": {"url": self.image_data_url(path)}}
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": self.image_data_url(path),
+                            "detail": "low",
+                        },
+                    }
                 )
 
         request_body = {
             "model": self.model,
             "temperature": 0.0,
             "max_tokens": self.max_tokens,
+            "stream": False,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -82,12 +97,53 @@ class LLMTeacherClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"teacher request failed ({error.code}): {detail}") from error
+        retryable_statuses = {429, 500, 502, 503, 504}
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                headers = error.headers
+                trace_id = (
+                    headers.get("x-siliconcloud-trace-id", "") if headers else ""
+                )
+                trace_text = f", trace_id={trace_id}" if trace_id else ""
+                message = f"teacher request failed ({error.code}{trace_text}): {detail}"
+                if error.code not in retryable_statuses or attempt >= self.max_retries:
+                    raise RuntimeError(message) from error
+
+                retry_after = None
+                if headers:
+                    try:
+                        retry_after = float(headers.get("Retry-After", ""))
+                    except (TypeError, ValueError):
+                        retry_after = None
+                delay = min(self.retry_base_delay * (2 ** attempt), 60.0)
+                if retry_after is not None:
+                    delay = max(delay, retry_after)
+                delay += random.uniform(0.0, min(1.0, delay * 0.1))
+                print(
+                    f"[retry] HTTP {error.code}; retry "
+                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s"
+                    f"{trace_text}",
+                    flush=True,
+                )
+                time.sleep(delay)
+            except (urllib.error.URLError, TimeoutError) as error:
+                if attempt >= self.max_retries:
+                    raise RuntimeError(
+                        f"teacher request transport failure: {error}"
+                    ) from error
+                delay = min(self.retry_base_delay * (2 ** attempt), 60.0)
+                delay += random.uniform(0.0, min(1.0, delay * 0.1))
+                print(
+                    f"[retry] transport error; retry "
+                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s: {error}",
+                    flush=True,
+                )
+                time.sleep(delay)
 
         content = payload["choices"][0]["message"]["content"]
         if isinstance(content, list):
