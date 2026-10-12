@@ -5,6 +5,22 @@ from transformers import BertModel, ViTModel
 from torchcrf import CRF
 
 
+def _teacher_token_mask(
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    subword_label_id: int | None,
+    llm_available: torch.Tensor | None,
+) -> torch.Tensor:
+    """Select word-level positions that have usable teacher supervision."""
+    valid_tokens = attention_mask.bool()
+    if subword_label_id is not None:
+        valid_tokens = valid_tokens & labels.ne(subword_label_id)
+    result = valid_tokens.float()
+    if llm_available is not None:
+        result = result * llm_available.float().view(-1, 1)
+    return result
+
+
 class RelativePositionMultiheadAttention(nn.Module):
     def __init__(
         self,
@@ -172,6 +188,7 @@ class AgvsMnerModel(nn.Module):
         self.image_dropout_prob = getattr(args, "image_dropout_prob", 0.2)
         self.llm_token_loss_weight = getattr(args, "llm_token_loss_weight", 0.0)
         self.llm_image_loss_weight = getattr(args, "llm_image_loss_weight", 0.0)
+        self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
         self.bert = BertModel.from_pretrained(args.bert_model)
@@ -503,9 +520,16 @@ class AgvsMnerModel(nn.Module):
                     teacher_probs,
                     reduction="none",
                 ).sum(dim=-1)
-                valid_tokens = attention_mask_bool.float()
-                if llm_available is not None:
-                    valid_tokens = valid_tokens * llm_available.float().view(-1, 1)
+                # Gold labels use X for continuation pieces and special tokens,
+                # whereas the teacher cache stores entity probabilities for all
+                # WordPieces. Excluding X positions avoids contradictory CRF and
+                # KL supervision while keeping existing caches reusable.
+                valid_tokens = _teacher_token_mask(
+                    attention_mask_bool,
+                    labels,
+                    self.subword_label_id,
+                    llm_available,
+                )
                 total_loss = total_loss + self.llm_token_loss_weight * (
                     token_kl * valid_tokens
                 ).sum() / valid_tokens.sum().clamp_min(1.0)

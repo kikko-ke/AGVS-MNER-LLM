@@ -12,6 +12,8 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import BertTokenizer, ViTImageProcessor
 
+from modules.text_utils import normalize_unicode_text, normalize_words
+
 
 NER_LABELS = (
     "O",
@@ -65,7 +67,7 @@ class MnerProcessor:
                 normalized_labels = [
                     label.replace("MISC", "MIS") for label in raw_labels
                 ]
-                words.append(text)
+                words.append(normalize_words(text))
                 labels.append(normalized_labels)
                 images.append(image_names)
 
@@ -141,43 +143,76 @@ class MultimodalNerDataset(Dataset[tuple[torch.Tensor, ...]]):
 
         return pixel_values, image_mask
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
-        word_list = self.examples["words"][index]
-        label_list = self.examples["labels"][index]
-        image_pixel_values, image_mask = self._encode_images(self.examples["images"][index])
-
+    def _encode_text(
+        self,
+        word_list: list[str],
+        label_list: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize each word once and keep token IDs aligned with BIO labels."""
         tokens: list[str] = []
         label_ids: list[int] = []
         for word, label in zip(word_list, label_list):
-            word_tokens = self.tokenizer.tokenize(word)
+            word_tokens = self.tokenizer.tokenize(normalize_unicode_text(word))
+            if not word_tokens:
+                continue
             tokens.extend(word_tokens)
-            if word_tokens:
-                label_ids.append(self.label_mapping[label])
-                label_ids.extend(
-                    [self.label_mapping[SUBWORD_LABEL]] * (len(word_tokens) - 1)
-                )
+            label_ids.append(self.label_mapping[label])
+            label_ids.extend(
+                [self.label_mapping[SUBWORD_LABEL]] * (len(word_tokens) - 1)
+            )
 
         max_token_count = self.max_sequence_length - 2
         tokens = tokens[:max_token_count]
         label_ids = label_ids[:max_token_count]
 
-        encoded_text = self.tokenizer(
-            tokens,
-            is_split_into_words=True,
-            max_length=self.max_sequence_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors=None,
-        )
-        labels = [self.label_mapping[SUBWORD_LABEL], *label_ids, self.label_mapping[SUBWORD_LABEL]]
+        # ``tokens`` already contains WordPiece output. Calling the tokenizer with
+        # ``is_split_into_words=True`` here would tokenize pieces such as ``##ing``
+        # a second time and shift every following label. Convert the pieces directly
+        # to IDs so inputs, gold labels, and cached teacher probabilities share the
+        # exact same positions.
+        token_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        input_id_values = [self.tokenizer.cls_token_id, *token_ids, self.tokenizer.sep_token_id]
+        attention_mask_values = [1] * len(input_id_values)
+        padding_length = self.max_sequence_length - len(input_id_values)
+        input_id_values.extend([self.tokenizer.pad_token_id] * padding_length)
+        attention_mask_values.extend([0] * padding_length)
+        token_type_id_values = [0] * self.max_sequence_length
+
+        labels = [
+            self.label_mapping[SUBWORD_LABEL],
+            *label_ids,
+            self.label_mapping[SUBWORD_LABEL],
+        ]
         labels.extend([self.label_mapping["O"]] * (self.max_sequence_length - len(labels)))
 
+        input_ids = torch.tensor(input_id_values, dtype=torch.long)
+        token_type_ids = torch.tensor(token_type_id_values, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask_values, dtype=torch.long)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        expected_length = self.max_sequence_length
+        if not all(
+            tensor.shape == (expected_length,)
+            for tensor in (input_ids, token_type_ids, attention_mask, label_tensor)
+        ):
+            raise ValueError("Encoded text and labels must have max_seq_length positions")
+
+        return input_ids, token_type_ids, attention_mask, label_tensor
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        word_list = self.examples["words"][index]
+        label_list = self.examples["labels"][index]
+        image_pixel_values, image_mask = self._encode_images(self.examples["images"][index])
+        input_ids, token_type_ids, attention_mask, labels = self._encode_text(
+            word_list,
+            label_list,
+        )
+
         return (
-            torch.tensor(encoded_text["input_ids"], dtype=torch.long),
-            torch.tensor(encoded_text["token_type_ids"], dtype=torch.long),
-            torch.tensor(encoded_text["attention_mask"], dtype=torch.long),
+            input_ids,
+            token_type_ids,
+            attention_mask,
             image_pixel_values,
-            torch.tensor(labels, dtype=torch.long),
+            labels,
             image_mask,
         )
 

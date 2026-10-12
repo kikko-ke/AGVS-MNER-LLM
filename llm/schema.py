@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from modules.text_utils import normalize_words
+
 ENTITY_TYPES = ("MIS", "PER", "ORG", "LOC")
 MAX_IMAGES = 4
 
@@ -128,7 +130,9 @@ def teacher_to_soft_labels(
         for index in range(len(row)):
             row[index] /= normaliser
 
-    word_pieces: list[list[str]] = [tokenizer.tokenize(word) for word in words]
+    word_pieces: list[list[str]] = [
+        tokenizer.tokenize(word) for word in normalize_words(words)
+    ]
     token_positions: list[list[int]] = []
     cursor = 1
     for pieces in word_pieces:

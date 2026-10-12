@@ -10,12 +10,16 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from seqeval.metrics import classification_report
+from seqeval.metrics import (
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from torch import optim
 from tqdm.auto import tqdm
 from transformers.optimization import get_linear_schedule_with_warmup
-
-from ner_evaluate import evaluate
 
 
 class NerTrainer:
@@ -127,8 +131,6 @@ class NerTrainer:
         decoded_label_ids: list[list[int]],
         true_labels: list[list[str]],
         predicted_labels: list[list[str]],
-        true_label_ids: list[list[int]],
-        predicted_label_ids: list[list[int]],
     ) -> None:
         masks = attention_mask.detach().cpu().tolist()
         target_label_ids = labels.detach().cpu().tolist()
@@ -143,9 +145,12 @@ class NerTrainer:
                 if self.index_to_label[target_id] != "X"
             ]
             sample_target_ids = [target_id for target_id, _ in filtered_pairs]
-            sample_prediction_ids = [prediction_id for _, prediction_id in filtered_pairs]
-            true_label_ids.append(sample_target_ids)
-            predicted_label_ids.append(sample_prediction_ids)
+            outside_label_id = self.label_map["O"]
+            subword_label_id = self.label_map.get("X")
+            sample_prediction_ids = [
+                outside_label_id if prediction_id == subword_label_id else prediction_id
+                for _, prediction_id in filtered_pairs
+            ]
             true_labels.append([self.index_to_label[label_id] for label_id in sample_target_ids])
             predicted_labels.append(
                 [self.index_to_label[label_id] for label_id in sample_prediction_ids]
@@ -162,8 +167,6 @@ class NerTrainer:
         total_loss = 0.0
         true_labels: list[list[str]] = []
         predicted_labels: list[list[str]] = []
-        true_label_ids: list[list[int]] = []
-        predicted_label_ids: list[list[int]] = []
 
         context = torch.enable_grad() if training else torch.no_grad()
         with context:
@@ -190,22 +193,27 @@ class NerTrainer:
                     decoded_label_ids,
                     true_labels,
                     predicted_labels,
-                    true_label_ids,
-                    predicted_label_ids,
                 )
 
-        accuracy, f1, precision, recall = evaluate(
-            predicted_label_ids,
-            true_label_ids,
-            self.label_map,
-        )
+        # Use the same seqeval definitions for logging, early stopping, checkpoint
+        # selection, and final reporting. This prevents the displayed micro F1 from
+        # disagreeing with the value used to select the best checkpoint.
+        accuracy = accuracy_score(true_labels, predicted_labels)
+        f1 = f1_score(true_labels, predicted_labels, zero_division=0)
+        precision = precision_score(true_labels, predicted_labels, zero_division=0)
+        recall = recall_score(true_labels, predicted_labels, zero_division=0)
         return {
             "loss": total_loss / max(len(data_loader), 1),
             "accuracy": accuracy,
             "f1": f1,
             "precision": precision,
             "recall": recall,
-            "report": classification_report(true_labels, predicted_labels, digits=4),
+            "report": classification_report(
+                true_labels,
+                predicted_labels,
+                digits=4,
+                zero_division=0,
+            ),
         }
 
     def train(self) -> None:
