@@ -12,6 +12,7 @@ distillation:
   grounding_confidence: 0.7
   grounding_temperature: 0.1
   grounding_size: 256
+  grounding_fusion: true
   grounding_class_balance: true
   max_seq_length: 64
   max_images: 4

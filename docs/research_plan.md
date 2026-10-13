@@ -56,7 +56,7 @@ Grounding 损失为：
 
 主方法先固定同一 seed、batch size 和学习率，搜索 `lambda_ground={0.02,0.05,0.1,0.2}` 与 `tau={0.5,0.7,0.8}`。选择只能依据验证集 F1，测试集只在配置确定后运行一次。至少报告 3 个随机种子的均值和标准差。
 
-附加消融：自由 MNER 缓存 vs gold-conditioned grounding、去掉 confidence gate、辅助头不进入融合、去掉 NONE、把实体级 target 换成全局 image score、随机打乱教师 image_ids、固定 slot-0、CLIP 图文相似度教师，以及按实体类型和图片数量分组报告 F1。正式实验还应加入图片顺序置换一致性，并至少人工核查 100–200 个实体的图片证据。
+附加消融：自由 MNER 缓存 vs gold-conditioned grounding、去掉 confidence gate、使用 `--no-llm-grounding-fusion` 让辅助头不进入融合、去掉 NONE、把实体级 target 换成全局 image score、随机打乱教师 image_ids、固定 slot-0、CLIP 图文相似度教师，以及按实体类型和图片数量分组报告 F1。正式实验还应加入图片顺序置换一致性，并至少人工核查 100–200 个实体的图片证据。
 
 ## 训练前审计
 

@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-grounding-temperature", type=float, default=0.1)
     parser.add_argument("--llm-grounding-size", type=int, default=256)
     parser.add_argument(
+        "--llm-grounding-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Feed the learned entity-image distribution into NER fusion",
+    )
+    parser.add_argument(
         "--llm-grounding-class-balance",
         action=argparse.BooleanOptionalAction,
         default=True,

@@ -229,6 +229,7 @@ class AgvsMnerModel(nn.Module):
         self.llm_image_loss_weight = getattr(args, "llm_image_loss_weight", 0.0)
         self.llm_grounding_loss_weight = getattr(args, "llm_grounding_loss_weight", 0.0)
         self.llm_grounding_temperature = getattr(args, "llm_grounding_temperature", 0.1)
+        self.llm_grounding_fusion = getattr(args, "llm_grounding_fusion", True)
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
@@ -586,7 +587,7 @@ class AgvsMnerModel(nn.Module):
             value=image_tokens,
             key_padding_mask=selected_image_key_padding_mask
         )
-        if grounding_visual_context is not None:
+        if grounding_visual_context is not None and self.llm_grounding_fusion:
             cv = cv + torch.tanh(
                 self.grounding_fusion_scale
             ) * grounding_visual_context
