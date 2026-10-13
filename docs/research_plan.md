@@ -1,4 +1,4 @@
-# 研究计划：可靠性门控的 LLM 实体—图像 Grounding
+# 研究计划：G-MEG（Gold-conditioned MLLM Evidence Gating）
 
 ## 动机
 
@@ -20,7 +20,7 @@ LLM 仍然包含数据集标注没有提供的信息：一个正确实体由哪�
 
 `g_i = sum_m p(m|i) * v_m`
 
-`h'_i = LayerNorm(h_i + AGVS_i + tanh(alpha) * W_g g_i)`
+`h'_i = LayerNorm(h_i + visual_strength * gate_i * (AGVS_i + tanh(alpha) * W_g g_i))`
 
 其中 `p(NONE)` 自动吸收不需要视觉证据的概率质量。辅助头不只是训练时旁路，推理时学生仍会自行预测实体相关图片并控制视觉融合。
 

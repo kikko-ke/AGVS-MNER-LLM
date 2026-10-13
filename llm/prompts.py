@@ -44,6 +44,7 @@ Use only image_ids for image slots that are actually provided.
 Use an empty image_ids list when the images do not visually support the entity.
 confidence is confidence in the visual-evidence decision, including a decision that
 none of the images supports the entity; it is not confidence in the gold entity label.
+When image_ids is empty, use high confidence only if you are confident that NONE is correct.
 The image_scores array must contain four non-negative numbers and should sum to 1."""
 
 
