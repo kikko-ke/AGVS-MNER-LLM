@@ -4,19 +4,19 @@
 
 ## 研究主线
 
-推荐先做“多模态 LLM 教师 -> AGVS 学生”的蒸馏路线：
+当前主线是“可靠性门控的 LLM 实体—图像 grounding 教师”：
 
 1. 离线教师读取一条文本和最多四张有序图像，输出结构化实体候选：start/end、实体类型、支撑图像编号、置信度，以及每张图的证据分数。
-2. scripts/build_teacher_cache.py 将教师输出转换为固定长度的 token 软标签和图像分布，写入 JSONL 缓存。
-3. 学生训练时仍由 BERT + ViT + AGVS + CRF 完成推理，同时加入 token KL 蒸馏和图像注意力蒸馏。
+2. 训练集标注只负责可靠性门控：教师实体必须与 gold 的边界和类型完全一致，并超过置信度阈值；否则不参与辅助损失。
+3. 对通过门控的实体，LLM 提供数据集原本没有的支撑图像编号。学生学习实体 token 与对应图像 CLS 表征的对齐损失，NER 主任务仍使用 gold + CRF。
 4. 部署时不需要调用 LLM，只有训练好的学生模型参与预测。
 
-这样可以把 LLM 的跨图像语义判断引入训练，又保留 BIO/CRF 的稳定边界和较低推理成本。教师模型可以使用 Qwen2.5-VL、Qwen3-VL、InternVL 或任意兼容 OpenAI Chat Completions 的视觉语言模型。
+这避免了低质量教师 BIO 预测直接污染 NER 监督，并把 LLM 的作用集中在它相对有价值的跨图像证据判断上。教师模型可以使用 Qwen2.5-VL、Qwen3-VL、InternVL 或任意兼容 OpenAI Chat Completions 的视觉语言模型。旧的 token KL 和全局 image KL 仍保留用于消融，但默认关闭。
 
 ## 项目结构
 
 AGVS-MNER-LLM/
-- models/agvs_mner.py: AGVS 学生模型，增加 LLM 蒸馏损失接口
+- models/agvs_mner.py: AGVS 学生模型与实体—图像 grounding 辅助损失
 - modules/dataset.py: 沿用原始 MNER-MI 数据格式
 - modules/llm_dataset.py: 叠加教师缓存的 Dataset
 - modules/llm_trainer.py: 将教师信号送入模型的训练器
@@ -24,6 +24,7 @@ AGVS-MNER-LLM/
 - llm/prompts.py: 结构化多图像 MNER 提示词
 - llm/client.py: OpenAI-compatible LLM 客户端
 - scripts/build_teacher_cache.py: 离线生成教师缓存
+- scripts/audit_llm_grounding.py: 统计不同置信度阈值下可用的 grounding 监督
 - run.py: 原始 AGVS 基线入口
 - run_llm.py: LLM 蒸馏训练入口
 - configs/llm_distill.yaml: 实验配置样例
@@ -36,24 +37,29 @@ AGVS-MNER-LLM/
     cd D:\code\pycharmProjects\AGVS-MNER-LLM
     pip install -r requirements.txt
 
-先为 train、val、test 分别生成同名教师缓存：
+主方法只需要为训练集生成 gold-conditioned grounding 缓存。请使用新的缓存目录，避免与旧的自由 NER 缓存混写：
 
-    python scripts/build_teacher_cache.py --input D:\code\pycharmProjects\AGVS-MNER\dataset\text\MNER-UNI_train.txt --output .\teacher_cache\MNER-UNI_train.jsonl --image-root D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter-image-root D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --base-url https://your-endpoint/v1 --api-key $env:LLM_API_KEY --model your-vision-language-model
+    python scripts/build_teacher_cache.py --teacher-task grounding --input D:\code\pycharmProjects\AGVS-MNER\dataset\text\MNER-UNI_train.txt --output .\teacher_cache\qwen_grounding\MNER-UNI_train.jsonl --image-root D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter-image-root D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --base-url https://your-endpoint/v1 --api-key $env:LLM_API_KEY --model your-vision-language-model
 
 生成缓存后训练：
 
-    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache --device cuda
+    python scripts/audit_llm_grounding.py --teacher-task grounding --input D:\code\pycharmProjects\AGVS-MNER\dataset\text\MNER-UNI_train.txt --cache .\teacher_cache\qwen_grounding\MNER-UNI_train.jsonl --image-root D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter-image-root D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images
+
+    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache\qwen_grounding --teacher-cache-task grounding --device cuda --llm-token-loss-weight 0 --llm-image-loss-weight 0 --llm-grounding-loss-weight 0.1 --llm-grounding-confidence 0.7
 
 缓存生成是离线步骤，训练循环不会请求外部 LLM。若不提供缓存，直接运行原始 run.py 即可得到 AGVS 基线。
+启用 grounding loss 时，训练入口会检查缓存任务、文件存在性和可用实体数，避免因路径或阈值错误静默退化成普通基线。旧缓存可用 `--teacher-cache-task mner` 做先导实验，但其中的 confidence 含义不同，不作为正式主结果。
 
 ## 建议对照
 
 - AGVS baseline：不使用教师信号。
-- LLM-token：只启用 token 软标签蒸馏。
-- LLM-image：只启用图像证据分布蒸馏。
-- Full：同时启用两种蒸馏。
+- Raw token KD：旧的 token 软标签蒸馏，作为负结果/消融。
+- Global image KD：旧的样本级图像分布蒸馏，作为消融。
+- LLM grounding：只启用可靠性门控的实体—图片监督（主方法）。
+- No gold-consistency gate：取消边界/类型一致性门控，验证可靠性门控的必要性。
+- Confidence：比较 0.5/0.7/0.8/0.9 阈值。
 - Image-count：按 1/2/3/4 张图分别报告 F1。
 - Teacher ablation：比较纯文本 LLM、带图像的 VLM，以及不同教师模型。
 
-教师输出只作为训练信号；实体边界最终仍由学生的 CRF 决定。后续可以加入 LoRA 视觉语言模型、实体级对比学习、图像关系图和在线候选重排。
+教师输出只作为训练时的视觉 grounding 信号；实体边界最终仍由学生的 CRF 决定。方法定义和实验矩阵见 `docs/research_plan.md`。
 

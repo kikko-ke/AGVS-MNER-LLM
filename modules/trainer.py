@@ -165,6 +165,7 @@ class NerTrainer:
             self.model.eval()
 
         total_loss = 0.0
+        loss_component_totals: dict[str, float] = {}
         true_labels: list[list[str]] = []
         predicted_labels: list[list[str]] = []
 
@@ -175,6 +176,17 @@ class NerTrainer:
                     self._move_batch_to_device(batch)
                 )
                 total_loss += loss.detach().item()
+                for name, value in getattr(
+                    self.model, "last_loss_components", {}
+                ).items():
+                    scalar = (
+                        value.detach().item()
+                        if isinstance(value, torch.Tensor)
+                        else float(value)
+                    )
+                    loss_component_totals[name] = (
+                        loss_component_totals.get(name, 0.0) + scalar
+                    )
 
                 if training:
                     loss.backward()
@@ -214,6 +226,10 @@ class NerTrainer:
                 digits=4,
                 zero_division=0,
             ),
+            "loss_components": {
+                name: total / max(len(data_loader), 1)
+                for name, total in loss_component_totals.items()
+            },
         }
 
     def train(self) -> None:
@@ -227,6 +243,9 @@ class NerTrainer:
                 self.train_data, training=True, progress_bar=progress_bar
             )
             self.logger.info("Train results:\n%s", train_metrics["report"])
+            self.logger.info(
+                "Train loss components: %s", train_metrics["loss_components"]
+            )
 
             dev_metrics = self.evaluate(epoch)
             self._log_epoch_results(epoch, train_metrics, dev_metrics)
@@ -250,6 +269,7 @@ class NerTrainer:
         self.logger.info("Evaluating on the validation set.")
         metrics = self._run_epoch(self.dev_data, training=False)
         self.logger.info("Validation results:\n%s", metrics["report"])
+        self.logger.info("Validation loss components: %s", metrics["loss_components"])
 
         if metrics["f1"] >= self.best_dev_f1:
             self.best_dev_f1 = metrics["f1"]

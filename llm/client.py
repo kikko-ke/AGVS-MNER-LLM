@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import base64
 import json
-import mimetypes
 import os
 import random
 import time
 import urllib.error
 import urllib.request
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
 
-from llm.prompts import SYSTEM_PROMPT, USER_TEMPLATE
+from PIL import Image, UnidentifiedImageError
+
+from llm.prompts import (
+    GROUNDING_SYSTEM_PROMPT,
+    GROUNDING_USER_TEMPLATE,
+    SYSTEM_PROMPT,
+    USER_TEMPLATE,
+)
 
 
 class LLMTeacherClient:
@@ -45,33 +52,94 @@ class LLMTeacherClient:
 
     @staticmethod
     def image_data_url(path: Path) -> str:
-        mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:{mime_type};base64,{encoded}"
+        """Return a decodable image, repairing JPEG EOF and tiny inputs."""
+        raw_bytes = path.read_bytes()
+        image: Image.Image | None = None
+        for candidate in (raw_bytes, raw_bytes + b"\xff\xd9"):
+            try:
+                with Image.open(BytesIO(candidate)) as opened:
+                    image = opened.convert("RGB")
+                    image.load()
+                break
+            except (OSError, UnidentifiedImageError):
+                continue
+        if image is None:
+            raise ValueError(f"unreadable image: {path}")
 
-    def complete_json(self, words: Iterable[str], image_paths: Iterable[Path | None]) -> dict[str, Any]:
+        minimum_side = min(image.size)
+        if minimum_side < 32:
+            scale = 32.0 / max(minimum_side, 1)
+            resized = (
+                max(32, round(image.width * scale)),
+                max(32, round(image.height * scale)),
+            )
+            image = image.resize(resized, Image.Resampling.BICUBIC)
+
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    def complete_json(
+        self,
+        words: Iterable[str],
+        image_paths: Iterable[Path | None],
+        annotated_entities: Iterable[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         indexed_words = "\n".join(f"{index}: {word}" for index, word in enumerate(words))
         image_paths = list(image_paths)
+        prepared_images: list[str | None] = []
+        for path in image_paths:
+            if path is None or not path.exists():
+                prepared_images.append(None)
+                continue
+            try:
+                prepared_images.append(self.image_data_url(path))
+            except (OSError, ValueError):
+                prepared_images.append(None)
+
         manifest = "\n".join(
-            f"{index}: {path.name if path else '[missing image]'}"
+            f"{index}: {path.name if path and prepared_images[index] else '[missing image]'}"
             for index, path in enumerate(image_paths)
         )
+        annotated_entities = (
+            None if annotated_entities is None else list(annotated_entities)
+        )
+        if annotated_entities is None:
+            system_prompt = SYSTEM_PROMPT
+            user_text = USER_TEMPLATE.format(
+                indexed_words=indexed_words,
+                image_manifest=manifest,
+            )
+        else:
+            system_prompt = GROUNDING_SYSTEM_PROMPT
+            user_text = GROUNDING_USER_TEMPLATE.format(
+                indexed_words=indexed_words,
+                annotated_entities=json.dumps(
+                    annotated_entities, ensure_ascii=False, indent=2
+                ),
+                image_manifest=manifest,
+            )
+
         user_content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": USER_TEMPLATE.format(
-                    indexed_words=indexed_words,
-                    image_manifest=manifest,
-                ),
+                "text": user_text,
             }
         ]
-        for path in image_paths:
-            if path and path.exists():
+        for image_id, data_url in enumerate(prepared_images):
+            if data_url is not None:
+                user_content.append(
+                    {
+                        "type": "text",
+                        "text": f"The next image is image slot {image_id}.",
+                    }
+                )
                 user_content.append(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": self.image_data_url(path),
+                            "url": data_url,
                             "detail": "low",
                         },
                     }
@@ -84,7 +152,7 @@ class LLMTeacherClient:
             "stream": False,
             "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
         }

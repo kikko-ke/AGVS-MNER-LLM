@@ -23,6 +23,8 @@ class LlmNerTrainer(NerTrainer):
             llm_token_probs,
             llm_image_scores,
             llm_available,
+            llm_grounding_targets,
+            llm_grounding_weights,
         ) = batch
         decoded_label_ids, loss = self.model(
             input_ids=input_ids,
@@ -34,5 +36,7 @@ class LlmNerTrainer(NerTrainer):
             llm_token_probs=llm_token_probs,
             llm_image_scores=llm_image_scores,
             llm_available=llm_available,
+            llm_grounding_targets=llm_grounding_targets,
+            llm_grounding_weights=llm_grounding_weights,
         )
         return attention_mask, labels, decoded_label_ids, loss

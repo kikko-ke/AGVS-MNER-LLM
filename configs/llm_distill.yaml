@@ -1,12 +1,18 @@
 teacher:
   provider: openai-compatible
   model: qwen2.5-vl-7b-instruct
+  task: grounding
   temperature: 0.0
   max_tokens: 1024
 
 distillation:
-  token_loss_weight: 0.5
-  image_loss_weight: 0.2
+  token_loss_weight: 0.0
+  image_loss_weight: 0.0
+  grounding_loss_weight: 0.1
+  grounding_confidence: 0.7
+  grounding_temperature: 0.1
+  grounding_size: 256
+  grounding_class_balance: true
   max_seq_length: 64
   max_images: 4
 
@@ -16,4 +22,4 @@ research:
   secondary_metrics:
     - entity_precision
     - entity_recall
-    - image_grounding_kl
+    - accepted_grounding_entities

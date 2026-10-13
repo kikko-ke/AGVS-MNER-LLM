@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -27,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vit-model", default="../pretrained_models/ViTB-16")
     parser.add_argument("--dataset", default="UNI", choices=("MI", "UNI"))
     parser.add_argument("--teacher-cache", required=True)
+    parser.add_argument(
+        "--teacher-cache-task",
+        choices=("mner", "grounding"),
+        default="grounding",
+        help="Expected cache semantics; old caches without metadata are mner",
+    )
     parser.add_argument("--output-dir", default="./outputs_llm")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-epochs", type=int, default=15)
@@ -44,8 +51,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk-img-patches", type=int, default=12)
     parser.add_argument("--image-dropout-prob", type=float, default=0.2)
     parser.add_argument("--output-dropout", type=float, default=0.2)
-    parser.add_argument("--llm-token-loss-weight", type=float, default=0.5)
-    parser.add_argument("--llm-image-loss-weight", type=float, default=0.2)
+    # Raw teacher NER predictions are intentionally disabled by default. The
+    # reliable LLM signal is entity-to-image evidence whose span/type agrees
+    # with the gold training annotation.
+    parser.add_argument("--llm-token-loss-weight", type=float, default=0.0)
+    parser.add_argument("--llm-image-loss-weight", type=float, default=0.0)
+    parser.add_argument("--llm-grounding-loss-weight", type=float, default=0.1)
+    parser.add_argument("--llm-grounding-confidence", type=float, default=0.7)
+    parser.add_argument("--llm-grounding-temperature", type=float, default=0.1)
+    parser.add_argument("--llm-grounding-size", type=int, default=256)
+    parser.add_argument(
+        "--llm-grounding-class-balance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -74,9 +93,46 @@ def main() -> None:
     dev_base = MultimodalNerDataset(args, f"MNER-{args.dataset}_val.txt")
     test_base = MultimodalNerDataset(args, f"MNER-{args.dataset}_test.txt")
     cache_dir = Path(args.teacher_cache)
-    train_data = TeacherCacheDataset(train_base, cache_dir / f"MNER-{args.dataset}_train.jsonl")
-    dev_data = TeacherCacheDataset(dev_base, cache_dir / f"MNER-{args.dataset}_val.jsonl")
-    test_data = TeacherCacheDataset(test_base, cache_dir / f"MNER-{args.dataset}_test.jsonl")
+    if args.llm_token_loss_weight > 0 and args.teacher_cache_task == "grounding":
+        raise ValueError(
+            "Grounding caches receive gold entities and cannot be used for token KD; "
+            "use a separate mner cache for the Raw token KD ablation"
+        )
+    train_data = TeacherCacheDataset(
+        train_base,
+        cache_dir / f"MNER-{args.dataset}_train.jsonl",
+        grounding_confidence_threshold=args.llm_grounding_confidence,
+        expected_teacher_task=args.teacher_cache_task,
+        balance_grounding_classes=args.llm_grounding_class_balance,
+    )
+    dev_data = TeacherCacheDataset(
+        dev_base,
+        cache_dir / f"MNER-{args.dataset}_val.jsonl",
+        grounding_confidence_threshold=args.llm_grounding_confidence,
+        enable_grounding=False,
+    )
+    test_data = TeacherCacheDataset(
+        test_base,
+        cache_dir / f"MNER-{args.dataset}_test.jsonl",
+        grounding_confidence_threshold=args.llm_grounding_confidence,
+        enable_grounding=False,
+    )
+
+    if args.llm_grounding_loss_weight > 0:
+        train_cache_path = cache_dir / f"MNER-{args.dataset}_train.jsonl"
+        if not train_cache_path.exists():
+            raise FileNotFoundError(
+                f"Grounding loss is enabled but train cache is missing: {train_cache_path}"
+            )
+        summary = train_data.grounding_summary()
+        logging.getLogger(__name__).info(
+            "LLM grounding supervision: %s", json.dumps(summary, ensure_ascii=False)
+        )
+        if summary["entities"] == 0:
+            raise ValueError(
+                "Grounding loss is enabled but no teacher entity passed the cache task, "
+                "gold-consistency, confidence, and image-evidence checks"
+            )
 
     loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}
     train_loader = DataLoader(train_data, shuffle=True, **loader_args)
@@ -86,7 +142,13 @@ def main() -> None:
     label_mapping = train_base.processor.get_label_mapping(include_subword_label=True)
     model = AgvsMnerModel(list(label_mapping), args)
     trainer = LlmNerTrainer(
-        train_loader, dev_loader, test_loader, model, label_mapping, args, logging.getLogger(__name__)
+        train_loader,
+        dev_loader,
+        test_loader,
+        model,
+        label_mapping,
+        args,
+        logging.getLogger(__name__),
     )
     trainer.train()
 

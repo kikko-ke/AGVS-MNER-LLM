@@ -5,17 +5,18 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from transformers import BertTokenizer
 
 from llm.client import LLMTeacherClient
-from llm.schema import teacher_to_soft_labels, validate_teacher_output
+from llm.schema import TeacherOutput, teacher_to_soft_labels, validate_teacher_output
 from modules.dataset import MnerProcessor
+from modules.llm_dataset import extract_bio_entities
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-base-delay", type=float, default=2.0)
     parser.add_argument("--request-delay", type=float, default=1.0)
     parser.add_argument("--max-consecutive-failures", type=int, default=3)
+    parser.add_argument(
+        "--teacher-task",
+        choices=("mner", "grounding"),
+        default="mner",
+        help="mner predicts entities; grounding receives gold train entities and annotates images",
+    )
     parser.add_argument("--limit", type=int, default=0, help="只处理N个待处理样本，0表示全部")
     parser.add_argument("--resume", action="store_true", help="断点续传，跳过已处理的样本")
     return parser.parse_args()
@@ -42,6 +49,9 @@ def parse_args() -> argparse.Namespace:
 
 def image_path(name: str, image_root: Path, twitter_root: Path) -> Path:
     if "twitter2017" in name:
+        full_path = twitter_root / name
+        if full_path.exists():
+            return full_path
         return twitter_root / name.split("-", maxsplit=1)[1]
     return image_root / name
 
@@ -50,6 +60,7 @@ def load_valid_sample_ids(
     path: Path,
     max_seq_length: int,
     num_labels: int,
+    teacher_task: str,
 ) -> set[int]:
     """Return complete cache IDs and reject mixed or malformed cache files."""
     if not path.exists():
@@ -81,6 +92,7 @@ def load_valid_sample_ids(
                 )
                 and isinstance(scores, list)
                 and len(scores) == 4
+                and record.get("teacher_task", "mner") == teacher_task
             )
             if not valid:
                 raise ValueError(
@@ -93,6 +105,30 @@ def load_valid_sample_ids(
             sample_ids.add(sample_id)
 
     return sample_ids
+
+
+def validate_grounding_contract(
+    teacher: TeacherOutput, annotated_entities: list[dict]
+) -> None:
+    """Ensure a gold-conditioned teacher returned every supplied entity once."""
+    expected = {
+        (int(entity["start"]), int(entity["end"]), str(entity["label"]))
+        for entity in annotated_entities
+    }
+    returned_list = [
+        (entity.start, entity.end, entity.label)
+        for entity in teacher.entities
+    ]
+    returned = set(returned_list)
+    if len(returned_list) != len(returned):
+        raise ValueError("grounding teacher returned duplicate entities")
+    if returned != expected:
+        missing = sorted(expected - returned)
+        extra = sorted(returned - expected)
+        raise ValueError(
+            f"grounding teacher changed the gold entity contract; "
+            f"missing={missing}, extra={extra}"
+        )
 
 
 def main() -> None:
@@ -125,7 +161,12 @@ def main() -> None:
         )
 
     existing_ids = (
-        load_valid_sample_ids(output_path, args.max_seq_length, len(label_mapping))
+        load_valid_sample_ids(
+            output_path,
+            args.max_seq_length,
+            len(label_mapping),
+            args.teacher_task,
+        )
         if args.resume
         else set()
     )
@@ -158,27 +199,70 @@ def main() -> None:
             try:
                 record = ast.literal_eval(line)
                 words = record["text"]
+                labels = [label.replace("MISC", "MIS") for label in record["label"]]
                 image_names = record.get("images", [])[:4]
                 paths = [image_path(name, image_root, twitter_root) for name in image_names]
                 paths.extend([None] * (4 - len(paths)))
-                raw_payload = client.complete_json(words, paths)
+                annotated_entities = None
+                if args.teacher_task == "grounding":
+                    annotated_entities = [
+                        {"start": start, "end": end, "label": entity_type}
+                        for start, end, entity_type in sorted(
+                            extract_bio_entities(labels)
+                        )
+                    ]
+
+                if annotated_entities == []:
+                    available_images = sum(
+                        path is not None and path.exists() for path in paths
+                    )
+                    if available_images:
+                        score = 1.0 / available_images
+                        image_scores = [
+                            score if path is not None and path.exists() else 0.0
+                            for path in paths
+                        ]
+                    else:
+                        image_scores = [1.0, 0.0, 0.0, 0.0]
+                    raw_payload = {"entities": [], "image_scores": image_scores}
+                else:
+                    raw_payload = client.complete_json(
+                        words,
+                        paths,
+                        annotated_entities=annotated_entities,
+                    )
                 teacher = validate_teacher_output(
                     raw_payload,
                     token_count=len(words),
                     num_images=4,
                     raw_text=json.dumps(raw_payload, ensure_ascii=False),
                 )
-                token_probs, image_scores = teacher_to_soft_labels(
-                    teacher,
-                    words,
-                    tokenizer,
-                    args.max_seq_length,
-                    label_mapping,
-                )
+                if args.teacher_task == "grounding":
+                    assert annotated_entities is not None
+                    validate_grounding_contract(teacher, annotated_entities)
+                    # The grounding prompt receives gold spans, so converting
+                    # its entities to token probabilities would leak gold labels
+                    # into a purported distillation target. Store a neutral
+                    # placeholder solely for backward-compatible cache shape.
+                    uniform_probability = 1.0 / len(label_mapping)
+                    token_probs = [
+                        [uniform_probability] * len(label_mapping)
+                        for _ in range(args.max_seq_length)
+                    ]
+                    image_scores = list(teacher.image_scores)
+                else:
+                    token_probs, image_scores = teacher_to_soft_labels(
+                        teacher,
+                        words,
+                        tokenizer,
+                        args.max_seq_length,
+                        label_mapping,
+                    )
                 output_file.write(
                     json.dumps(
                         {
                             "sample_id": sample_id,
+                            "teacher_task": args.teacher_task,
                             "token_probs": token_probs,
                             "image_scores": image_scores,
                             "entities": [

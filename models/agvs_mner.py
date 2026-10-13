@@ -21,6 +21,45 @@ def _teacher_token_mask(
     return result
 
 
+def _masked_grounding_loss(
+    logits: torch.Tensor,
+    image_mask: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Confidence-weighted cross entropy over valid entity/image targets."""
+    valid_image_mask = image_mask.bool()
+    if targets.size(-1) != valid_image_mask.size(-1) + 1:
+        raise ValueError("Grounding targets must contain image slots plus NONE")
+    valid_candidate_mask = torch.cat(
+        [
+            valid_image_mask,
+            torch.ones(
+                valid_image_mask.size(0),
+                1,
+                dtype=torch.bool,
+                device=valid_image_mask.device,
+            ),
+        ],
+        dim=-1,
+    )
+
+    masked_logits = logits.masked_fill(
+        ~valid_candidate_mask.unsqueeze(1),
+        torch.finfo(logits.dtype).min,
+    )
+    log_probs = F.log_softmax(masked_logits, dim=-1)
+
+    masked_targets = targets.to(logits.device) * valid_candidate_mask.unsqueeze(1).float()
+    target_mass = masked_targets.sum(dim=-1, keepdim=True)
+    normalised_targets = masked_targets / target_mass.clamp_min(1e-12)
+    token_loss = -(normalised_targets * log_probs).sum(dim=-1)
+
+    effective_weights = weights.to(logits.device).float()
+    effective_weights = effective_weights * target_mass.squeeze(-1).gt(0).float()
+    return (token_loss * effective_weights).sum() / effective_weights.sum().clamp_min(1.0)
+
+
 class RelativePositionMultiheadAttention(nn.Module):
     def __init__(
         self,
@@ -188,6 +227,8 @@ class AgvsMnerModel(nn.Module):
         self.image_dropout_prob = getattr(args, "image_dropout_prob", 0.2)
         self.llm_token_loss_weight = getattr(args, "llm_token_loss_weight", 0.0)
         self.llm_image_loss_weight = getattr(args, "llm_image_loss_weight", 0.0)
+        self.llm_grounding_loss_weight = getattr(args, "llm_grounding_loss_weight", 0.0)
+        self.llm_grounding_temperature = getattr(args, "llm_grounding_temperature", 0.1)
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
@@ -286,6 +327,26 @@ class AgvsMnerModel(nn.Module):
         self.fc = nn.Linear(self.hidden_size, self.num_labels)
         self.crf = CRF(self.num_labels, batch_first=True)
 
+        # Build the new head without advancing the global RNG. This preserves
+        # the exact seeded DataLoader/dropout stream for a weight-zero baseline.
+        cpu_rng_state = torch.get_rng_state()
+        try:
+            grounding_size = getattr(args, "llm_grounding_size", 256)
+            self.grounding_text_proj = nn.Linear(
+                self.hidden_size, grounding_size, bias=False
+            )
+            self.grounding_image_proj = nn.Linear(
+                self.hidden_size, grounding_size, bias=False
+            )
+            self.grounding_none = nn.Parameter(torch.empty(grounding_size))
+            nn.init.normal_(self.grounding_none, std=0.02)
+            self.grounding_fusion_proj = nn.Linear(
+                self.hidden_size, self.hidden_size, bias=False
+            )
+            self.grounding_fusion_scale = nn.Parameter(torch.tensor(0.1))
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+
     @property
     def slot_embedding(self):
         """The paper's learnable image-slot embedding table."""
@@ -302,6 +363,8 @@ class AgvsMnerModel(nn.Module):
         llm_token_probs=None,
         llm_image_scores=None,
         llm_available=None,
+        llm_grounding_targets=None,
+        llm_grounding_weights=None,
         return_features=False
     ):
         if image_pixel_values is None:
@@ -357,11 +420,13 @@ class AgvsMnerModel(nn.Module):
         vit_output = self.vit(pixel_values=pixel_values)
         vit_seq = vit_output.last_hidden_state
 
-        cls_tokens = vit_seq[:, 0, :].reshape(
+        raw_cls_tokens = vit_seq[:, 0, :].reshape(
             batch_size,
             image_count,
             self.hidden_size
         )
+        raw_cls_tokens = raw_cls_tokens * image_mask_bool.unsqueeze(-1).float()
+        cls_tokens = raw_cls_tokens
 
         patch_tokens = vit_seq[:, 1:, :].reshape(
             batch_size,
@@ -387,6 +452,54 @@ class AgvsMnerModel(nn.Module):
                 src_key_padding_mask=image_key_padding_mask
             )
             cls_tokens = cls_tokens * safe_image_mask.unsqueeze(-1).float()
+
+        # -----------------------------
+        # 2b. Entity-conditioned image selector (four slots + NONE)
+        # -----------------------------
+        grounding_logits = None
+        grounding_visual_context = None
+        if self.llm_grounding_loss_weight > 0:
+            grounding_text = F.normalize(
+                self.grounding_text_proj(text_seq), dim=-1
+            )
+            grounding_images = F.normalize(
+                self.grounding_image_proj(raw_cls_tokens), dim=-1
+            )
+            grounding_none = F.normalize(self.grounding_none, dim=0)
+            image_grounding_logits = torch.bmm(
+                grounding_text, grounding_images.transpose(1, 2)
+            )
+            none_grounding_logits = torch.matmul(
+                grounding_text, grounding_none
+            ).unsqueeze(-1)
+            grounding_logits = torch.cat(
+                [image_grounding_logits, none_grounding_logits], dim=-1
+            ) / max(float(self.llm_grounding_temperature), 1e-6)
+
+            valid_grounding_candidates = torch.cat(
+                [
+                    image_mask_bool,
+                    torch.ones(
+                        batch_size, 1, dtype=torch.bool, device=device
+                    ),
+                ],
+                dim=-1,
+            )
+            grounding_probabilities = torch.softmax(
+                grounding_logits.masked_fill(
+                    ~valid_grounding_candidates.unsqueeze(1),
+                    torch.finfo(grounding_logits.dtype).min,
+                ),
+                dim=-1,
+            )
+            # The missing mass is p(NONE), so this context is automatically
+            # suppressed when the student decides that vision is irrelevant.
+            grounding_visual_context = torch.bmm(
+                grounding_probabilities[..., :image_count], raw_cls_tokens
+            )
+            grounding_visual_context = self.grounding_fusion_proj(
+                grounding_visual_context
+            )
 
         # -----------------------------
         # 3. Text-conditioned global query
@@ -473,6 +586,10 @@ class AgvsMnerModel(nn.Module):
             value=image_tokens,
             key_padding_mask=selected_image_key_padding_mask
         )
+        if grounding_visual_context is not None:
+            cv = cv + torch.tanh(
+                self.grounding_fusion_scale
+            ) * grounding_visual_context
 
         # -----------------------------
         # 7. Vector gating fusion
@@ -511,6 +628,7 @@ class AgvsMnerModel(nn.Module):
                 reduction="mean"
             )
             total_loss = ner_loss
+            loss_components = {"ner": ner_loss.detach()}
 
             if llm_token_probs is not None and self.llm_token_loss_weight > 0:
                 teacher_probs = llm_token_probs.to(emissions.device).clamp_min(1e-6)
@@ -530,9 +648,11 @@ class AgvsMnerModel(nn.Module):
                     self.subword_label_id,
                     llm_available,
                 )
-                total_loss = total_loss + self.llm_token_loss_weight * (
+                token_loss = (
                     token_kl * valid_tokens
                 ).sum() / valid_tokens.sum().clamp_min(1.0)
+                total_loss = total_loss + self.llm_token_loss_weight * token_loss
+                loss_components["raw_token_kd"] = token_loss.detach()
 
             if llm_image_scores is not None and self.llm_image_loss_weight > 0:
                 student_images = global_attn_weights.squeeze(1).clamp_min(1e-6)
@@ -549,9 +669,31 @@ class AgvsMnerModel(nn.Module):
                     if llm_available is not None
                     else torch.ones_like(image_kl)
                 )
-                total_loss = total_loss + self.llm_image_loss_weight * (
+                image_loss = (
                     image_kl * valid_samples
                 ).sum() / valid_samples.sum().clamp_min(1.0)
+                total_loss = total_loss + self.llm_image_loss_weight * image_loss
+                loss_components["global_image_kd"] = image_loss.detach()
+
+            if (
+                llm_grounding_targets is not None
+                and llm_grounding_weights is not None
+                and self.llm_grounding_loss_weight > 0
+            ):
+                assert grounding_logits is not None
+                grounding_loss = _masked_grounding_loss(
+                    grounding_logits,
+                    image_mask_bool,
+                    llm_grounding_targets,
+                    llm_grounding_weights,
+                )
+                total_loss = (
+                    total_loss
+                    + self.llm_grounding_loss_weight * grounding_loss
+                )
+                loss_components["entity_image_grounding"] = grounding_loss.detach()
+
+            self.last_loss_components = loss_components
 
             logits = self.crf.decode(
                 emissions,
@@ -561,6 +703,7 @@ class AgvsMnerModel(nn.Module):
                 return logits, total_loss, {
                     "token_emissions": emissions,
                     "image_attention": global_attn_weights,
+                    "grounding_logits": grounding_logits,
                 }
             return logits, total_loss
 
@@ -572,6 +715,7 @@ class AgvsMnerModel(nn.Module):
             return logits, None, {
                 "token_emissions": emissions,
                 "image_attention": global_attn_weights,
+                "grounding_logits": grounding_logits,
             }
         return (logits,)
 

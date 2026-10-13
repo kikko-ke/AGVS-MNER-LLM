@@ -122,13 +122,19 @@ def teacher_to_soft_labels(
 ) -> tuple[list[list[float]], list[float]]:
     """Convert word-level teacher spans to fixed-size token probabilities."""
     num_labels = len(label_mapping)
-    base = 0.02
-    probs = [[base] * num_labels for _ in range(max_seq_length)]
-    for row in probs:
-        row[label_mapping["O"]] += 0.90
-        normaliser = sum(row)
-        for index in range(len(row)):
-            row[index] /= normaliser
+
+    def smoothed(label_name: str, confidence: float) -> list[float]:
+        confidence = min(max(confidence, 1.0 / num_labels), 0.999)
+        other_probability = (1.0 - confidence) / (num_labels - 1)
+        row = [other_probability] * num_labels
+        row[label_mapping[label_name]] = confidence
+        return row
+
+    # A previous implementation assigned O=0.1 and every other class=0.02,
+    # which normalised to only 0.357 O probability and created false-positive
+    # pressure on every non-entity token. Keep the legacy KD ablation valid by
+    # using explicit label smoothing instead.
+    probs = [smoothed("O", 0.98) for _ in range(max_seq_length)]
 
     word_pieces: list[list[str]] = [
         tokenizer.tokenize(word) for word in normalize_words(words)
@@ -144,12 +150,7 @@ def teacher_to_soft_labels(
     for position in [p for group in token_positions for p in group]:
         if position >= max_position:
             continue
-        for label_index in range(num_labels):
-            probs[position][label_index] = base
-        probs[position][label_mapping["O"]] = 0.1
-        normaliser = sum(probs[position])
-        for label_index in range(num_labels):
-            probs[position][label_index] /= normaliser
+        probs[position] = smoothed("O", 0.98)
 
     for entity in teacher.entities:
         for word_index in range(entity.start, min(entity.end, len(token_positions))):
@@ -161,11 +162,8 @@ def teacher_to_soft_labels(
                 label_name = f"{prefix}-{entity.label}"
                 if label_name not in label_mapping:
                     continue
-                for label_index in range(num_labels):
-                    probs[position][label_index] = base
-                probs[position][label_mapping[label_name]] = max(entity.confidence, 0.5)
-                normaliser = sum(probs[position])
-                for label_index in range(num_labels):
-                    probs[position][label_index] /= normaliser
+                probs[position] = smoothed(
+                    label_name, max(entity.confidence, 0.5)
+                )
 
     return probs, list(teacher.image_scores)

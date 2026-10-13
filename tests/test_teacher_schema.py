@@ -46,3 +46,25 @@ def test_teacher_to_soft_labels_marks_bio_positions():
     assert scores[0] == 1.0
 
 
+def test_teacher_soft_labels_keep_non_entities_confidently_outside():
+    labels = {
+        "O": 0,
+        "B-MIS": 1,
+        "I-MIS": 2,
+        "B-PER": 3,
+        "I-PER": 4,
+        "B-ORG": 5,
+        "I-ORG": 6,
+        "B-LOC": 7,
+        "I-LOC": 8,
+        "X": 9,
+    }
+    teacher = validate_teacher_output(
+        {"entities": [], "image_scores": [1]}, token_count=1
+    )
+    probs, _ = teacher_to_soft_labels(
+        teacher, ["hello"], TinyTokenizer(), 5, labels
+    )
+    assert probs[1][labels["O"]] == 0.98
+
+
