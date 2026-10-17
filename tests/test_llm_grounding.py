@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from models.agvs_mner import _grounding_features_for_loss, _masked_grounding_loss
+from models.agvs_mner import (
+    _apply_visual_utility_gate,
+    _grounding_features_for_loss,
+    _masked_grounding_loss,
+)
 from modules.llm_dataset import build_grounding_targets, extract_bio_entities
 
 
@@ -177,3 +181,72 @@ def test_grounding_loss_can_detach_shared_encoder_features():
     )
     assert live_text is text
     assert live_images is images
+
+
+def test_visual_utility_targets_encode_additional_value_and_text_sufficiency():
+    targets, weights = build_grounding_targets(
+        words=["Alice", "Acme", "Paris"],
+        gold_labels=["B-PER", "B-ORG", "B-LOC"],
+        teacher_entities=[
+            {
+                "start": 0,
+                "end": 1,
+                "label": "PER",
+                "image_ids": [],
+                "confidence": 0.9,
+                "text_sufficient": True,
+                "visual_utility": 0.0,
+            },
+            {
+                "start": 1,
+                "end": 2,
+                "label": "ORG",
+                "image_ids": [1],
+                "confidence": 0.8,
+                "text_sufficient": False,
+                "visual_utility": 0.75,
+            },
+            {
+                "start": 2,
+                "end": 3,
+                "label": "LOC",
+                "image_ids": [0],
+                "confidence": 0.7,
+                "text_sufficient": False,
+                "visual_utility": 0.4,
+            },
+        ],
+        tokenizer=GroundingTokenizer(),
+        max_sequence_length=8,
+        image_mask=torch.tensor([1, 1, 0, 0]),
+        confidence_threshold=0.7,
+        teacher_task="utility",
+        visual_utility_threshold=0.5,
+    )
+
+    assert targets[1].tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+    assert targets[2].tolist() == [0.0, 0.75, 0.0, 0.0, 0.25]
+    assert targets[3].tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+    assert torch.allclose(weights[[1, 2, 3]], torch.tensor([0.9, 0.8, 0.7]))
+
+
+def test_visual_utility_gate_is_identity_at_zero_and_detaches_selector():
+    visual = torch.ones((1, 2, 3), requires_grad=True)
+    probabilities = torch.tensor(
+        [[[0.1, 0.1, 0.1, 0.1, 0.6], [0.0, 0.0, 0.0, 0.0, 1.0]]],
+        requires_grad=True,
+    )
+    zero_scale = torch.tensor(0.0, requires_grad=True)
+    identity = _apply_visual_utility_gate(visual, probabilities, zero_scale)
+    assert torch.equal(identity, visual)
+    negative = _apply_visual_utility_gate(
+        visual, probabilities, torch.tensor(-0.5)
+    )
+    assert torch.equal(negative, visual)
+
+    positive_scale = torch.tensor(0.5, requires_grad=True)
+    gated = _apply_visual_utility_gate(visual, probabilities, positive_scale)
+    assert torch.all(gated[:, 1] < gated[:, 0])
+    gated.sum().backward()
+    assert probabilities.grad is None
+    assert positive_scale.grad is not None

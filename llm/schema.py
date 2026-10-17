@@ -19,6 +19,8 @@ class EntityEvidence:
     image_ids: tuple[int, ...]
     confidence: float
     evidence: str = ""
+    text_sufficient: bool = False
+    visual_utility: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,14 @@ def _normalise_label(value: Any) -> str:
     if label not in ENTITY_TYPES:
         raise ValueError(f"unknown entity type: {label}")
     return label
+
+
+def _as_bool(value: Any, field: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
 
 
 def _normalise_scores(value: Any, num_images: int = MAX_IMAGES) -> tuple[float, ...]:
@@ -95,6 +105,20 @@ def validate_teacher_output(
             )
         )
         confidence = min(max(float(raw_entity.get("confidence", 1.0)), 0.0), 1.0)
+        text_sufficient = _as_bool(
+            raw_entity.get("text_sufficient"), "text_sufficient"
+        )
+        visual_utility = min(
+            max(
+                float(
+                    raw_entity.get(
+                        "visual_utility", 1.0 if image_ids else 0.0
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
+        )
         entities.append(
             EntityEvidence(
                 start=start,
@@ -103,6 +127,8 @@ def validate_teacher_output(
                 image_ids=image_ids,
                 confidence=confidence,
                 evidence=str(raw_entity.get("evidence", "")),
+                text_sufficient=text_sufficient,
+                visual_utility=visual_utility,
             )
         )
 

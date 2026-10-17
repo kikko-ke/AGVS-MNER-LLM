@@ -1,28 +1,30 @@
-# 研究计划：G-MEG（Gold-conditioned MLLM Evidence Gating）
+# 研究计划：C-VUG（Counterfactual Visual Utility Gating）
 
 ## 动机
 
 现有 Qwen3-VL 教师在训练缓存上的实体 F1 只有 0.5060。直接对全部 token 做 KL 蒸馏会把错误边界、错误类型和过多的非实体预测传给学生；已有实验中 Full KD（0.8318）没有超过同配置的无教师基线（0.8324）。
 
-LLM 仍然包含数据集标注没有提供的信息：一个正确实体由哪张图支撑。因此主方法不再让 LLM 重复教授已有的 BIO 标签。正式缓存使用 `--teacher-task grounding`，把训练集 gold 实体交给 VLM，只让它补充跨图像证据；旧缓存也可通过 gold-consistency gate 用于先导实验。
+后续消融进一步表明“实体由哪张图描绘”也不足以提升 NER：分离梯度的 G-MEG v2 最佳验证 F1 为 0.8203，关闭其融合后为 0.8208，均低于 0.8257 基线。原因是视觉相关性不等于视觉增量价值。C-VUG 因此让 VLM 比较只看文本与加入图像两种条件，只监督图片是否提供额外的实体类型消歧信息。
+
+正式缓存使用 `--teacher-task utility`，把训练集 gold 实体交给 VLM。教师输出 `text_sufficient`、连续 `visual_utility` 和有额外价值的图片编号，不预测或修改 BIO 标签。
 
 ## 方法
 
-对训练集中的教师实体 `e=(start,end,type,confidence,image_ids)` 定义可靠性门：
+对训练集中的教师实体 `e=(start,end,type,confidence,text_sufficient,visual_utility,image_ids)` 定义可靠性门：
 
 `z_e = 1[教师 span/type 与 gold 实体完全一致] * 1[confidence >= tau] * 1[所选证据槽位有效]`
 
-只有 `z_e=1` 的实体进入辅助任务。教师目标是五路分布 `q_e=[img0,img1,img2,img3,NONE]`；空 `image_ids` 对应 NONE，明确教授学生何时不应使用视觉信息。学生把实体中每个词的首个 WordPiece 表征 `h_i` 与四张图的原始 ViT CLS 表征 `v_m` 投影到同一空间，避免从图像槽位嵌入中走捷径：
+只有 `z_e=1` 的实体进入辅助任务。教师目标是五路分布 `q_e=[img0,img1,img2,img3,NONE]`。文本充分或效用低于阈值时 `q(NONE)=1`；否则总计 `visual_utility` 的概率分配给有用图片，剩余概率分配给 NONE。学生把实体中每个词的首个 WordPiece 表征 `h_i` 与四张图的原始 ViT CLS 表征 `v_m` 投影到同一空间：
 
 `p(m|i) = softmax([cos(W_t h_i, W_v v_0..3), s_NONE] / T)`
 
-预测的图像概率直接进入 NER 决策路径：
+预测的 NONE 概率控制原 AGVS 视觉分支：
 
-`g_i = sum_m p(m|i) * v_m`
+`AGVS'_i = (1 - clamp(tanh(beta),0,1) * stopgrad(p(NONE|i))) * AGVS_i`
 
-`h'_i = LayerNorm(h_i + visual_strength * gate_i * (AGVS_i + tanh(alpha) * W_g g_i))`
+`h'_i = LayerNorm(h_i + visual_strength * gate_i * AGVS'_i)`
 
-其中 `p(NONE)` 自动吸收不需要视觉证据的概率质量。为解决第一版实验中共享辅助梯度造成的负迁移，正式模型增加两项保护：非实体词接受总质量受限的弱 NONE 监督，使背景 token 在推理时关闭视觉残差；教师 grounding 损失默认使用 detach 后的 BERT/ViT 特征，只更新证据选择头。视觉残差系数从 0 初始化，NER 主损失可在证据有用时自行增大它。辅助头不只是训练时旁路，推理时学生仍会自行预测实体相关图片并控制视觉融合。
+其中 `beta` 从 0 初始化，初始前向路径严格等于 AGVS。效用 posterior 在门控处停止梯度，防止 NER 目标覆盖教师语义；教师损失也使用 detach 后的 BERT/ViT 特征，只更新效用选择头。NER 只决定抑制强度 `beta`。非实体词接受总质量受限的弱 NONE 监督。推理时不调用 LLM，由学生自行预测视觉效用。
 
 Grounding 损失为：
 
@@ -38,8 +40,8 @@ Grounding 损失为：
 
 ## 核心贡献表述
 
-1. 提出可靠性门控的多模态 LLM 教师，只提取与人工标注一致实体的视觉证据，隔离生成式教师的标签噪声。
-2. 提出含 NONE 门的实体级多图 grounding 目标，并让预测分布直接控制 NER 视觉融合，把 LLM 的图片证据转化为学生的实际决策路径。
+1. 提出 gold 条件化的反事实视觉效用教师，区分图片描绘相关性与对实体类型的增量消歧价值。
+2. 提出连续效用—NONE 软目标与安全抑制门，在不改变基线初始前向路径的情况下控制视觉噪声。
 3. 教师完全离线，学生推理速度、API 成本和数据隐私边界与原 AGVS 一致。
 
 论文中应在实验得到支持后再写“提升性能”；在此之前可主张方法解决了 noisy teacher supervision，并通过消融验证机制。

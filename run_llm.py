@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-cache", required=True)
     parser.add_argument(
         "--teacher-cache-task",
-        choices=("mner", "grounding"),
+        choices=("mner", "grounding", "utility"),
         default="grounding",
         help="Expected cache semantics; old caches without metadata are mner",
     )
@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-image-loss-weight", type=float, default=0.0)
     parser.add_argument("--llm-grounding-loss-weight", type=float, default=0.1)
     parser.add_argument("--llm-grounding-confidence", type=float, default=0.7)
+    parser.add_argument(
+        "--llm-utility-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum additional visual utility before an entity receives an image target",
+    )
     parser.add_argument("--llm-grounding-temperature", type=float, default=0.1)
     parser.add_argument("--llm-grounding-size", type=int, default=256)
     parser.add_argument(
@@ -89,6 +95,18 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--llm-utility-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use predicted NONE probability to suppress the original AGVS visual branch",
+    )
+    parser.add_argument(
+        "--llm-utility-gate-init",
+        type=float,
+        default=0.0,
+        help="Initial utility-gate strength; zero exactly reproduces the AGVS path",
+    )
     return parser.parse_args()
 
 
@@ -114,6 +132,10 @@ def main() -> None:
         raise ValueError("--llm-grounding-background-ratio must be non-negative")
     if args.llm_grounding_temperature <= 0:
         raise ValueError("--llm-grounding-temperature must be positive")
+    if not 0 <= args.llm_utility_threshold <= 1:
+        raise ValueError("--llm-utility-threshold must be in [0, 1]")
+    if args.llm_utility_gate and args.teacher_cache_task != "utility":
+        raise ValueError("--llm-utility-gate requires --teacher-cache-task utility")
     configure_logging(args.output_dir)
     set_seed(args.seed)
 
@@ -121,7 +143,10 @@ def main() -> None:
     dev_base = MultimodalNerDataset(args, f"MNER-{args.dataset}_val.txt")
     test_base = MultimodalNerDataset(args, f"MNER-{args.dataset}_test.txt")
     cache_dir = Path(args.teacher_cache)
-    if args.llm_token_loss_weight > 0 and args.teacher_cache_task == "grounding":
+    if args.llm_token_loss_weight > 0 and args.teacher_cache_task in {
+        "grounding",
+        "utility",
+    }:
         raise ValueError(
             "Grounding caches receive gold entities and cannot be used for token KD; "
             "use a separate mner cache for the Raw token KD ablation"
@@ -133,6 +158,7 @@ def main() -> None:
         expected_teacher_task=args.teacher_cache_task,
         balance_grounding_classes=args.llm_grounding_class_balance,
         grounding_background_ratio=args.llm_grounding_background_ratio,
+        visual_utility_threshold=args.llm_utility_threshold,
     )
     dev_data = TeacherCacheDataset(
         dev_base,

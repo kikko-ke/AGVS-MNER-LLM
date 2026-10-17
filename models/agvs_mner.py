@@ -71,6 +71,25 @@ def _grounding_features_for_loss(
     return text_features, image_features
 
 
+def _apply_visual_utility_gate(
+    visual_context: torch.Tensor,
+    grounding_probabilities: torch.Tensor,
+    raw_gate_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Suppress visual context according to the teacher-trained NONE posterior.
+
+    The selector posterior is detached so the NER objective cannot overwrite the
+    LLM utility task. A zero raw scale is an exact identity transformation, which
+    gives the method a strict AGVS starting point.
+    """
+    none_probability = grounding_probabilities[..., -1:].detach()
+    # The utility teacher may suppress noisy vision but must never amplify it.
+    # At the zero boundary PyTorch keeps a usable gradient; if NER prefers a
+    # negative value the clamp safely falls back to the baseline path.
+    gate_strength = torch.tanh(raw_gate_scale).clamp(min=0.0, max=1.0)
+    return visual_context * (1.0 - gate_strength * none_probability)
+
+
 class RelativePositionMultiheadAttention(nn.Module):
     def __init__(
         self,
@@ -241,6 +260,7 @@ class AgvsMnerModel(nn.Module):
         self.llm_grounding_loss_weight = getattr(args, "llm_grounding_loss_weight", 0.0)
         self.llm_grounding_temperature = getattr(args, "llm_grounding_temperature", 0.1)
         self.llm_grounding_fusion = getattr(args, "llm_grounding_fusion", True)
+        self.llm_utility_gate = getattr(args, "llm_utility_gate", False)
         self.llm_grounding_detach_backbone = getattr(
             args, "llm_grounding_detach_backbone", True
         )
@@ -361,6 +381,9 @@ class AgvsMnerModel(nn.Module):
             self.grounding_fusion_scale = nn.Parameter(
                 torch.tensor(float(getattr(args, "llm_grounding_fusion_init", 0.0)))
             )
+            self.utility_gate_scale = nn.Parameter(
+                torch.tensor(float(getattr(args, "llm_utility_gate_init", 0.0)))
+            )
         finally:
             torch.set_rng_state(cpu_rng_state)
 
@@ -475,6 +498,7 @@ class AgvsMnerModel(nn.Module):
         # -----------------------------
         grounding_logits = None
         grounding_loss_logits = None
+        grounding_probabilities = None
         grounding_visual_context = None
         if self.llm_grounding_loss_weight > 0:
             def compute_grounding_logits(
@@ -627,6 +651,12 @@ class AgvsMnerModel(nn.Module):
             cv = cv + torch.tanh(
                 self.grounding_fusion_scale
             ) * grounding_visual_context
+        if grounding_probabilities is not None and self.llm_utility_gate:
+            cv = _apply_visual_utility_gate(
+                cv,
+                grounding_probabilities,
+                self.utility_gate_scale,
+            )
 
         # -----------------------------
         # 7. Vector gating fusion

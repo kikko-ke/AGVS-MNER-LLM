@@ -38,9 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-consecutive-failures", type=int, default=3)
     parser.add_argument(
         "--teacher-task",
-        choices=("mner", "grounding"),
+        choices=("mner", "grounding", "utility"),
         default="mner",
-        help="mner predicts entities; grounding receives gold train entities and annotates images",
+        help=(
+            "mner predicts entities; grounding marks depicted evidence; utility receives "
+            "gold entities and judges whether images add information beyond text"
+        ),
     )
     parser.add_argument("--limit", type=int, default=0, help="只处理N个待处理样本，0表示全部")
     parser.add_argument("--resume", action="store_true", help="断点续传，跳过已处理的样本")
@@ -131,6 +134,24 @@ def validate_grounding_contract(
         )
 
 
+def validate_utility_contract(
+    raw_payload: dict, teacher: TeacherOutput
+) -> None:
+    """Require explicit, internally consistent counterfactual utility fields."""
+    raw_entities = raw_payload.get("entities", [])
+    if len(raw_entities) != len(teacher.entities):
+        raise ValueError("utility teacher returned malformed entities")
+    for raw, entity in zip(raw_entities, teacher.entities):
+        if "text_sufficient" not in raw or "visual_utility" not in raw:
+            raise ValueError(
+                "utility teacher must return text_sufficient and visual_utility"
+            )
+        if entity.text_sufficient and entity.image_ids:
+            raise ValueError(
+                "utility teacher contradicted text_sufficient=true with visual evidence"
+            )
+
+
 def main() -> None:
     args = parse_args()
     tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=True)
@@ -204,7 +225,7 @@ def main() -> None:
                 paths = [image_path(name, image_root, twitter_root) for name in image_names]
                 paths.extend([None] * (4 - len(paths)))
                 annotated_entities = None
-                if args.teacher_task == "grounding":
+                if args.teacher_task in {"grounding", "utility"}:
                     annotated_entities = [
                         {"start": start, "end": end, "label": entity_type}
                         for start, end, entity_type in sorted(
@@ -230,6 +251,7 @@ def main() -> None:
                         words,
                         paths,
                         annotated_entities=annotated_entities,
+                        teacher_task=args.teacher_task,
                     )
                 teacher = validate_teacher_output(
                     raw_payload,
@@ -237,9 +259,11 @@ def main() -> None:
                     num_images=4,
                     raw_text=json.dumps(raw_payload, ensure_ascii=False),
                 )
-                if args.teacher_task == "grounding":
+                if args.teacher_task in {"grounding", "utility"}:
                     assert annotated_entities is not None
                     validate_grounding_contract(teacher, annotated_entities)
+                    if args.teacher_task == "utility":
+                        validate_utility_contract(raw_payload, teacher)
                     # The grounding prompt receives gold spans, so converting
                     # its entities to token probabilities would leak gold labels
                     # into a purported distillation target. Store a neutral
@@ -273,6 +297,13 @@ def main() -> None:
                                     "image_ids": list(entity.image_ids),
                                     "confidence": entity.confidence,
                                     "evidence": entity.evidence,
+                                    "text_sufficient": entity.text_sufficient,
+                                    "visual_utility": (
+                                        0.0
+                                        if args.teacher_task == "utility"
+                                        and entity.text_sufficient
+                                        else entity.visual_utility
+                                    ),
                                 }
                                 for entity in teacher.entities
                             ],

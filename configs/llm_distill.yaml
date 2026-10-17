@@ -1,7 +1,7 @@
 teacher:
   provider: openai-compatible
   model: qwen2.5-vl-7b-instruct
-  task: grounding
+  task: utility
   temperature: 0.0
   max_tokens: 1024
 
@@ -10,18 +10,21 @@ distillation:
   image_loss_weight: 0.0
   grounding_loss_weight: 0.1
   grounding_confidence: 0.7
+  visual_utility_threshold: 0.5
   grounding_temperature: 0.1
   grounding_size: 256
   grounding_background_ratio: 0.25
   grounding_detach_backbone: true
   grounding_fusion_init: 0.0
-  grounding_fusion: true
+  grounding_fusion: false
+  utility_gate: true
+  utility_gate_init: 0.0
   grounding_class_balance: true
   max_seq_length: 64
   max_images: 4
 
 research:
-  hypothesis: "LLM 的实体语义和跨图像证据判断能够改善长尾实体和弱视觉证据样本"
+  hypothesis: "LLM 的反事实视觉效用判断能够抑制无益图像并改善实体类型消歧"
   primary_metric: entity_f1
   secondary_metrics:
     - entity_precision

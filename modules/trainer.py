@@ -249,6 +249,19 @@ class NerTrainer:
 
             dev_metrics = self.evaluate(epoch)
             self._log_epoch_results(epoch, train_metrics, dev_metrics)
+            learned_controls = {}
+            for name in ("grounding_fusion_scale", "utility_gate_scale"):
+                parameter = getattr(self.model, name, None)
+                if parameter is not None:
+                    effective = torch.tanh(parameter.detach())
+                    if name == "utility_gate_scale":
+                        effective = effective.clamp(min=0.0, max=1.0)
+                    learned_controls[name] = {
+                        "raw": float(parameter.detach()),
+                        "effective": float(effective),
+                    }
+            if learned_controls:
+                self.logger.info("Learned visual controls: %s", learned_controls)
             self.logger.info(
                 "Epoch %d: best dev F1 %.4f (epoch %d)",
                 epoch,

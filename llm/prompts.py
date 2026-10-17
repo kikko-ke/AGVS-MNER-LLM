@@ -76,3 +76,54 @@ Return exactly this JSON shape:
 
 Return one entity object for every supplied gold entity, preserving its order.
 If no gold entities are supplied, return an empty entities list."""
+
+
+UTILITY_SYSTEM_PROMPT = """You are a careful counterfactual visual-utility annotator for multimodal NER.
+The user supplies tokenized text, ordered image slots, and gold entity spans/types.
+Do not add, remove, merge, split, relabel, or move an entity.
+For each supplied entity, compare two decisions: classifying it from the text alone,
+and classifying it from the text together with the supplied images.
+Select an image only when its visible content adds information that could resolve the
+entity type beyond the text. Mere depiction, topical similarity, logos, portraits, or
+scenery that repeat an already unambiguous text cue are not useful evidence.
+text_sufficient must be true when the surrounding text alone makes the entity type clear.
+visual_utility is the estimated additional value of the selected images on a 0..1 scale:
+0 means no additional disambiguation value and 1 means the type depends strongly on them.
+When text_sufficient is true, image_ids must be empty and visual_utility must be 0.
+When no supplied image adds disambiguating evidence, image_ids must be empty.
+confidence is confidence in this counterfactual utility judgment, not confidence in the
+gold entity label. Return JSON only and do not wrap JSON in Markdown.
+Use only image_ids for image slots that are actually provided.
+The image_scores array must contain four non-negative numbers and should sum to 1."""
+
+
+UTILITY_USER_TEMPLATE = """Judge the additional visual utility for the supplied gold entities.
+
+Sentence tokens with positions:
+{indexed_words}
+
+Gold entities (copy start, end, and label exactly):
+{annotated_entities}
+
+Images are provided in these numbered slots:
+{image_manifest}
+
+Return exactly this JSON shape:
+{{
+  "entities": [
+    {{
+      "start": 0,
+      "end": 1,
+      "label": "PER",
+      "text_sufficient": false,
+      "visual_utility": 0.85,
+      "image_ids": [0],
+      "confidence": 0.92,
+      "evidence": "why the image adds entity-type information beyond the text"
+    }}
+  ],
+  "image_scores": [0.7, 0.2, 0.1, 0.0]
+}}
+
+Return one entity object for every supplied gold entity, preserving its order.
+If no gold entities are supplied, return an empty entities list."""

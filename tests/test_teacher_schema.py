@@ -21,6 +21,28 @@ def test_teacher_schema_normalises_scores_and_labels():
     assert output.entities[0].confidence == 1.0
 
 
+def test_teacher_schema_preserves_counterfactual_utility_fields():
+    output = validate_teacher_output(
+        {
+            "entities": [
+                {
+                    "start": 0,
+                    "end": 1,
+                    "label": "ORG",
+                    "image_ids": [1],
+                    "confidence": 0.9,
+                    "text_sufficient": False,
+                    "visual_utility": 0.8,
+                }
+            ],
+            "image_scores": [0, 1, 0, 0],
+        },
+        token_count=1,
+    )
+    assert output.entities[0].text_sufficient is False
+    assert output.entities[0].visual_utility == 0.8
+
+
 def test_teacher_to_soft_labels_marks_bio_positions():
     labels = {
         "O": 0,

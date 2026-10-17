@@ -62,6 +62,8 @@ def build_grounding_targets(
     confidence_threshold: float,
     class_weights: dict[str, float] | None = None,
     background_ratio: float = 0.0,
+    teacher_task: str = "grounding",
+    visual_utility_threshold: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build gold-consistent entity-to-image targets from LLM evidence.
 
@@ -98,6 +100,12 @@ def build_grounding_targets(
             if entity_type.startswith(("B-", "I-")):
                 entity_type = entity_type[2:]
             confidence = min(max(float(entity.get("confidence", 1.0)), 0.0), 1.0)
+            visual_utility = min(
+                max(float(entity.get("visual_utility", 1.0)), 0.0), 1.0
+            )
+            text_sufficient = entity.get("text_sufficient", False)
+            if not isinstance(text_sufficient, bool):
+                continue
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -118,15 +126,31 @@ def build_grounding_targets(
             if 0 <= image_id < num_images and valid_images[image_id]:
                 image_ids.append(image_id)
         image_ids = sorted(set(image_ids))
-        # An explicitly empty list is a useful negative target (NONE). If the
-        # teacher selected images but every selected slot is invalid, skip the
-        # entity rather than silently turning corrupted evidence into NONE.
-        if not raw_image_ids:
-            image_ids = [num_images]
-        elif not image_ids:
-            continue
-
-        image_probability = 1.0 / len(image_ids)
+        # Utility supervision asks a counterfactual question: does vision add
+        # entity-type information beyond text? Low-utility/text-sufficient
+        # entities are explicit NONE targets even when an image depicts them.
+        target_distribution = torch.zeros(num_images + 1, dtype=torch.float)
+        if teacher_task == "utility":
+            if text_sufficient or visual_utility < visual_utility_threshold:
+                target_distribution[num_images] = 1.0
+            elif not raw_image_ids:
+                target_distribution[num_images] = 1.0
+            elif not image_ids:
+                # Selected slots existed in the response but none is a valid
+                # decodable image; do not turn corrupted evidence into NONE.
+                continue
+            else:
+                target_distribution[image_ids] = visual_utility / len(image_ids)
+                target_distribution[num_images] = 1.0 - visual_utility
+        else:
+            # An explicitly empty list is a useful negative target (NONE). If
+            # selected slots are invalid, skip rather than changing semantics.
+            if not raw_image_ids:
+                target_distribution[num_images] = 1.0
+            elif not image_ids:
+                continue
+            else:
+                target_distribution[image_ids] = 1.0 / len(image_ids)
         supervised_positions = [
             first_piece_positions[word_index]
             for word_index in range(start, min(end, len(first_piece_positions)))
@@ -140,8 +164,7 @@ def build_grounding_targets(
             assert position is not None
             if confidence < float(priorities[position]):
                 continue
-            targets[position].zero_()
-            targets[position, image_ids] = image_probability
+            targets[position] = target_distribution
             weights[position] = token_weight
             priorities[position] = confidence
 
@@ -186,6 +209,7 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         expected_teacher_task: str | None = None,
         balance_grounding_classes: bool = False,
         grounding_background_ratio: float = 0.0,
+        visual_utility_threshold: float = 0.5,
     ) -> None:
         self.base_dataset = base_dataset
         self.cache_path = Path(cache_path)
@@ -193,6 +217,7 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         self.enable_grounding = enable_grounding
         self.expected_teacher_task = expected_teacher_task
         self.grounding_background_ratio = grounding_background_ratio
+        self.visual_utility_threshold = visual_utility_threshold
         self.grounding_class_weights = self._grounding_class_weights(
             balance_grounding_classes
         )
@@ -248,6 +273,7 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         target_modes: Counter[str] = Counter()
         entity_count = 0
         token_count = 0
+        utility_sum = 0.0
 
         for sample_id, record in self.records.items():
             if not 0 <= sample_id < len(self.base_dataset):
@@ -267,6 +293,10 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
                         entity_type = entity_type[2:]
                     confidence = float(entity.get("confidence", 1.0))
                     raw_image_ids = entity.get("image_ids", [])
+                    visual_utility = min(
+                        max(float(entity.get("visual_utility", 0.0)), 0.0), 1.0
+                    )
+                    text_sufficient = entity.get("text_sufficient", False)
                 except (KeyError, TypeError, ValueError):
                     continue
                 if not isinstance(raw_image_ids, (list, tuple)):
@@ -287,7 +317,18 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
                 token_count += end - start
                 accepted_types[entity_type] += 1
                 accepted_samples.add(sample_id)
-                target_modes["image" if raw_image_ids else "NONE"] += 1
+                if self.expected_teacher_task == "utility":
+                    utility_sum += visual_utility
+                    if text_sufficient:
+                        target_modes["NONE_text_sufficient"] += 1
+                    elif visual_utility < self.visual_utility_threshold:
+                        target_modes["NONE_low_utility"] += 1
+                    elif raw_image_ids:
+                        target_modes["useful_images"] += 1
+                    else:
+                        target_modes["NONE_no_useful_image"] += 1
+                else:
+                    target_modes["image" if raw_image_ids else "NONE"] += 1
 
         return {
             "cache_records": len(self.records),
@@ -297,6 +338,11 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
             "entity_words": token_count,
             "types": dict(accepted_types),
             "targets": dict(target_modes),
+            "mean_visual_utility": (
+                utility_sum / entity_count
+                if self.expected_teacher_task == "utility" and entity_count
+                else None
+            ),
             "class_weights": self.grounding_class_weights,
         }
 
@@ -329,6 +375,8 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
                     confidence_threshold=self.grounding_confidence_threshold,
                     class_weights=self.grounding_class_weights,
                     background_ratio=self.grounding_background_ratio,
+                    teacher_task=self.expected_teacher_task or "grounding",
+                    visual_utility_threshold=self.visual_utility_threshold,
                 )
         return (
             *sample,

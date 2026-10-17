@@ -14,6 +14,7 @@ from modules.llm_dataset import TeacherCacheDataset
 from scripts.build_teacher_cache import (
     load_valid_sample_ids,
     validate_grounding_contract,
+    validate_utility_contract,
 )
 
 
@@ -76,6 +77,30 @@ def test_grounding_contract_requires_each_gold_entity_once():
 
     with pytest.raises(ValueError, match="changed the gold entity contract"):
         validate_grounding_contract(teacher, [])
+
+
+def test_utility_contract_requires_explicit_consistent_fields():
+    payload = {
+        "entities": [
+            {
+                "start": 0,
+                "end": 1,
+                "label": "PER",
+                "image_ids": [],
+                "confidence": 0.9,
+                "text_sufficient": True,
+                "visual_utility": 0.0,
+            }
+        ],
+        "image_scores": [1, 0, 0, 0],
+    }
+    teacher = validate_teacher_output(payload, token_count=1)
+    validate_utility_contract(payload, teacher)
+
+    payload["entities"][0]["image_ids"] = [0]
+    contradictory = validate_teacher_output(payload, token_count=1)
+    with pytest.raises(ValueError, match="contradicted"):
+        validate_utility_contract(payload, contradictory)
 
 
 class TinyTokenizer:

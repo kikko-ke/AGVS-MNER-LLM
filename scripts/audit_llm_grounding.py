@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="MNER training text file")
     parser.add_argument("--cache", required=True, help="Teacher JSONL cache")
     parser.add_argument(
-        "--teacher-task", choices=("mner", "grounding"), default="grounding"
+        "--teacher-task", choices=("mner", "grounding", "utility"), default="grounding"
     )
     parser.add_argument("--image-root")
     parser.add_argument("--twitter-image-root")
@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=(0.5, 0.7, 0.8, 0.9),
         help="Teacher confidence thresholds to compare",
+    )
+    parser.add_argument(
+        "--utility-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum counterfactual visual utility treated as useful",
     )
     return parser.parse_args()
 
@@ -112,6 +118,8 @@ def main() -> None:
         accepted_samples: set[int] = set()
         rejected = Counter()
         grounded_words = 0
+        utility_sum = 0.0
+        utility_count = 0
 
         for sample_id, item in cache.items():
             if not 0 <= sample_id < len(examples):
@@ -132,6 +140,8 @@ def main() -> None:
                     end = int(entity["end"])
                     entity_type = normalise_type(entity["label"])
                     confidence = float(entity.get("confidence", 1.0))
+                    visual_utility = float(entity.get("visual_utility", 0.0))
+                    text_sufficient = entity.get("text_sufficient", False)
                 except (KeyError, TypeError, ValueError):
                     rejected["malformed"] += 1
                     continue
@@ -141,6 +151,11 @@ def main() -> None:
                     continue
                 if confidence < threshold:
                     rejected["below_confidence"] += 1
+                    continue
+                if args.teacher_task == "utility" and not isinstance(
+                    text_sufficient, bool
+                ):
+                    rejected["malformed_text_sufficient"] += 1
                     continue
                 raw_image_ids = entity.get("image_ids", [])
                 if not isinstance(raw_image_ids, (list, tuple)):
@@ -159,7 +174,21 @@ def main() -> None:
                 accepted[entity_type] += 1
                 accepted_samples.add(sample_id)
                 grounded_words += end - start
-                if not raw_image_ids:
+                if args.teacher_task == "utility":
+                    visual_utility = min(max(visual_utility, 0.0), 1.0)
+                    utility_sum += visual_utility
+                    utility_count += 1
+                    if text_sufficient:
+                        grounding_modes["NONE_text_sufficient"] += 1
+                        if raw_image_ids or visual_utility > 0:
+                            rejected["contradictory_utility"] += 1
+                    elif visual_utility < args.utility_threshold:
+                        grounding_modes["NONE_low_utility"] += 1
+                    elif not raw_image_ids:
+                        grounding_modes["NONE_no_useful_image"] += 1
+                    else:
+                        grounding_modes["useful_images"] += 1
+                elif not raw_image_ids:
                     grounding_modes["NONE"] += 1
                 elif len(valid_image_ids) < 2:
                     grounding_modes["single_valid_image"] += 1
@@ -173,6 +202,8 @@ def main() -> None:
         print(f"受监督实体词数: {grounded_words}")
         print("类别分布:", dict(sorted(accepted.items())))
         print("Grounding 类型:", dict(sorted(grounding_modes.items())))
+        if utility_count:
+            print(f"平均视觉效用: {utility_sum / utility_count:.4f}")
         print("过滤原因:", dict(sorted(rejected.items())))
 
 

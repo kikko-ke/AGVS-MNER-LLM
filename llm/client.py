@@ -19,6 +19,8 @@ from llm.prompts import (
     GROUNDING_SYSTEM_PROMPT,
     GROUNDING_USER_TEMPLATE,
     SYSTEM_PROMPT,
+    UTILITY_SYSTEM_PROMPT,
+    UTILITY_USER_TEMPLATE,
     USER_TEMPLATE,
 )
 
@@ -85,6 +87,7 @@ class LLMTeacherClient:
         words: Iterable[str],
         image_paths: Iterable[Path | None],
         annotated_entities: Iterable[dict[str, Any]] | None = None,
+        teacher_task: str = "grounding",
     ) -> dict[str, Any]:
         indexed_words = "\n".join(f"{index}: {word}" for index, word in enumerate(words))
         image_paths = list(image_paths)
@@ -109,6 +112,15 @@ class LLMTeacherClient:
             system_prompt = SYSTEM_PROMPT
             user_text = USER_TEMPLATE.format(
                 indexed_words=indexed_words,
+                image_manifest=manifest,
+            )
+        elif teacher_task == "utility":
+            system_prompt = UTILITY_SYSTEM_PROMPT
+            user_text = UTILITY_USER_TEMPLATE.format(
+                indexed_words=indexed_words,
+                annotated_entities=json.dumps(
+                    annotated_entities, ensure_ascii=False, indent=2
+                ),
                 image_manifest=manifest,
             )
         else:
