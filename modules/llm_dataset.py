@@ -61,6 +61,7 @@ def build_grounding_targets(
     image_mask: torch.Tensor,
     confidence_threshold: float,
     class_weights: dict[str, float] | None = None,
+    background_ratio: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build gold-consistent entity-to-image targets from LLM evidence.
 
@@ -144,6 +145,34 @@ def build_grounding_targets(
             weights[position] = token_weight
             priorities[position] = confidence
 
+    # The image selector is used at inference for every token, while the
+    # teacher only annotates gold entities. Give background words a weak NONE
+    # target so unsupervised O tokens do not inject arbitrary visual context.
+    # The total background mass is a fraction of the accepted entity mass,
+    # keeping long sentences from overwhelming the teacher supervision.
+    if background_ratio > 0:
+        entity_word_indices = {
+            word_index
+            for start, end, _ in gold_entities
+            for word_index in range(start, end)
+        }
+        background_positions = [
+            position
+            for word_index, position in enumerate(first_piece_positions)
+            if position is not None and word_index not in entity_word_indices
+        ]
+        if background_positions:
+            positive_mass = float(weights.sum())
+            reference_mass = positive_mass if positive_mass > 0 else 1.0
+            background_weight = (
+                float(background_ratio) * reference_mass / len(background_positions)
+            )
+            for position in background_positions:
+                assert position is not None
+                targets[position].zero_()
+                targets[position, num_images] = 1.0
+                weights[position] = background_weight
+
     return targets, weights
 
 
@@ -156,12 +185,14 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         enable_grounding: bool = True,
         expected_teacher_task: str | None = None,
         balance_grounding_classes: bool = False,
+        grounding_background_ratio: float = 0.0,
     ) -> None:
         self.base_dataset = base_dataset
         self.cache_path = Path(cache_path)
         self.grounding_confidence_threshold = grounding_confidence_threshold
         self.enable_grounding = enable_grounding
         self.expected_teacher_task = expected_teacher_task
+        self.grounding_background_ratio = grounding_background_ratio
         self.grounding_class_weights = self._grounding_class_weights(
             balance_grounding_classes
         )
@@ -297,6 +328,7 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
                     image_mask=sample[5],
                     confidence_threshold=self.grounding_confidence_threshold,
                     class_weights=self.grounding_class_weights,
+                    background_ratio=self.grounding_background_ratio,
                 )
         return (
             *sample,

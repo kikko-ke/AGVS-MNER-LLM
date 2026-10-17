@@ -12,6 +12,9 @@ distillation:
   grounding_confidence: 0.7
   grounding_temperature: 0.1
   grounding_size: 256
+  grounding_background_ratio: 0.25
+  grounding_detach_backbone: true
+  grounding_fusion_init: 0.0
   grounding_fusion: true
   grounding_class_balance: true
   max_seq_length: 64

@@ -8,8 +8,9 @@
 
 1. 离线教师读取一条文本和最多四张有序图像，输出结构化实体候选：start/end、实体类型、支撑图像编号、置信度，以及每张图的证据分数。
 2. 训练集标注只负责可靠性门控：教师实体必须与 gold 的边界和类型完全一致，并超过置信度阈值；否则不参与辅助损失。
-3. 对通过门控的实体，LLM 提供数据集原本没有的支撑图像编号。学生学习实体 token 与对应图像 CLS 表征的对齐损失，NER 主任务仍使用 gold + CRF。
-4. 部署时不需要调用 LLM，只有训练好的学生模型参与预测。
+3. 对通过门控的实体，LLM 提供数据集原本没有的支撑图像编号；背景词接受弱 NONE 监督，使实体外 token 不会任意注入视觉信息。
+4. 教师损失默认只更新 grounding 选择头，不反向拉动共享 BERT/ViT；视觉残差从零开始，由 NER 主任务决定是否启用。
+5. 部署时不需要调用 LLM，只有训练好的学生模型参与预测。
 
 这避免了低质量教师 BIO 预测直接污染 NER 监督，并把 LLM 的作用集中在它相对有价值的跨图像证据判断上。教师模型可以使用 Qwen2.5-VL、Qwen3-VL、InternVL 或任意兼容 OpenAI Chat Completions 的视觉语言模型。旧的 token KL 和全局 image KL 仍保留用于消融，但默认关闭。
 
@@ -45,7 +46,7 @@ AGVS-MNER-LLM/
 
     python scripts/audit_llm_grounding.py --teacher-task grounding --input D:\code\pycharmProjects\AGVS-MNER\dataset\text\MNER-UNI_train.txt --cache .\teacher_cache\qwen_grounding\MNER-UNI_train.jsonl --image-root D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter-image-root D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images
 
-    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache\qwen_grounding --teacher-cache-task grounding --device cuda --llm-token-loss-weight 0 --llm-image-loss-weight 0 --llm-grounding-loss-weight 0.1 --llm-grounding-confidence 0.7
+    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache\qwen_grounding --teacher-cache-task grounding --device cuda --llm-token-loss-weight 0 --llm-image-loss-weight 0 --llm-grounding-loss-weight 0.1 --llm-grounding-confidence 0.9 --llm-grounding-background-ratio 0.25 --llm-grounding-detach-backbone --llm-grounding-fusion-init 0
 
 缓存生成是离线步骤，训练循环不会请求外部 LLM。若不提供缓存，直接运行原始 run.py 即可得到 AGVS 基线。
 启用 grounding loss 时，训练入口会检查缓存任务、文件存在性和可用实体数，避免因路径或阈值错误静默退化成普通基线。旧缓存可用 `--teacher-cache-task mner` 做先导实验，但其中的 confidence 含义不同，不作为正式主结果。
@@ -56,6 +57,8 @@ AGVS-MNER-LLM/
 - Raw token KD：旧的 token 软标签蒸馏，作为负结果/消融。
 - Global image KD：旧的样本级图像分布蒸馏，作为消融。
 - LLM grounding：只启用可靠性门控的实体—图片监督（主方法）。
+- Shared-gradient grounding：使用 `--no-llm-grounding-detach-backbone`，验证负迁移隔离的必要性。
+- No background NONE：设置 `--llm-grounding-background-ratio 0`，验证背景门控的必要性。
 - No gold-consistency gate：取消边界/类型一致性门控，验证可靠性门控的必要性。
 - Confidence：比较 0.5/0.7/0.8/0.9 阈值。
 - Image-count：按 1/2/3/4 张图分别报告 F1。

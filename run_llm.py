@@ -61,6 +61,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-grounding-temperature", type=float, default=0.1)
     parser.add_argument("--llm-grounding-size", type=int, default=256)
     parser.add_argument(
+        "--llm-grounding-background-ratio",
+        type=float,
+        default=0.25,
+        help="Total weak NONE supervision on background words relative to entity mass",
+    )
+    parser.add_argument(
+        "--llm-grounding-detach-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep teacher grounding gradients out of the shared BERT/ViT encoders",
+    )
+    parser.add_argument(
+        "--llm-grounding-fusion-init",
+        type=float,
+        default=0.0,
+        help="Initial residual scale for grounding-guided visual fusion",
+    )
+    parser.add_argument(
         "--llm-grounding-fusion",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -92,6 +110,10 @@ def main() -> None:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; use --device cpu.")
+    if args.llm_grounding_background_ratio < 0:
+        raise ValueError("--llm-grounding-background-ratio must be non-negative")
+    if args.llm_grounding_temperature <= 0:
+        raise ValueError("--llm-grounding-temperature must be positive")
     configure_logging(args.output_dir)
     set_seed(args.seed)
 
@@ -110,6 +132,7 @@ def main() -> None:
         grounding_confidence_threshold=args.llm_grounding_confidence,
         expected_teacher_task=args.teacher_cache_task,
         balance_grounding_classes=args.llm_grounding_class_balance,
+        grounding_background_ratio=args.llm_grounding_background_ratio,
     )
     dev_data = TeacherCacheDataset(
         dev_base,

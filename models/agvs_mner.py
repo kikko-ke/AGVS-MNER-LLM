@@ -60,6 +60,17 @@ def _masked_grounding_loss(
     return (token_loss * effective_weights).sum() / effective_weights.sum().clamp_min(1.0)
 
 
+def _grounding_features_for_loss(
+    text_features: torch.Tensor,
+    image_features: torch.Tensor,
+    detach_backbone: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optionally isolate the teacher objective from the shared encoders."""
+    if detach_backbone:
+        return text_features.detach(), image_features.detach()
+    return text_features, image_features
+
+
 class RelativePositionMultiheadAttention(nn.Module):
     def __init__(
         self,
@@ -230,6 +241,9 @@ class AgvsMnerModel(nn.Module):
         self.llm_grounding_loss_weight = getattr(args, "llm_grounding_loss_weight", 0.0)
         self.llm_grounding_temperature = getattr(args, "llm_grounding_temperature", 0.1)
         self.llm_grounding_fusion = getattr(args, "llm_grounding_fusion", True)
+        self.llm_grounding_detach_backbone = getattr(
+            args, "llm_grounding_detach_backbone", True
+        )
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
@@ -344,7 +358,9 @@ class AgvsMnerModel(nn.Module):
             self.grounding_fusion_proj = nn.Linear(
                 self.hidden_size, self.hidden_size, bias=False
             )
-            self.grounding_fusion_scale = nn.Parameter(torch.tensor(0.1))
+            self.grounding_fusion_scale = nn.Parameter(
+                torch.tensor(float(getattr(args, "llm_grounding_fusion_init", 0.0)))
+            )
         finally:
             torch.set_rng_state(cpu_rng_state)
 
@@ -458,24 +474,44 @@ class AgvsMnerModel(nn.Module):
         # 2b. Entity-conditioned image selector (four slots + NONE)
         # -----------------------------
         grounding_logits = None
+        grounding_loss_logits = None
         grounding_visual_context = None
         if self.llm_grounding_loss_weight > 0:
-            grounding_text = F.normalize(
-                self.grounding_text_proj(text_seq), dim=-1
-            )
-            grounding_images = F.normalize(
-                self.grounding_image_proj(raw_cls_tokens), dim=-1
-            )
-            grounding_none = F.normalize(self.grounding_none, dim=0)
-            image_grounding_logits = torch.bmm(
-                grounding_text, grounding_images.transpose(1, 2)
-            )
-            none_grounding_logits = torch.matmul(
-                grounding_text, grounding_none
-            ).unsqueeze(-1)
-            grounding_logits = torch.cat(
-                [image_grounding_logits, none_grounding_logits], dim=-1
-            ) / max(float(self.llm_grounding_temperature), 1e-6)
+            def compute_grounding_logits(
+                text_features: torch.Tensor,
+                image_features: torch.Tensor,
+            ) -> torch.Tensor:
+                grounding_text = F.normalize(
+                    self.grounding_text_proj(text_features), dim=-1
+                )
+                grounding_images = F.normalize(
+                    self.grounding_image_proj(image_features), dim=-1
+                )
+                grounding_none = F.normalize(self.grounding_none, dim=0)
+                image_logits = torch.bmm(
+                    grounding_text, grounding_images.transpose(1, 2)
+                )
+                none_logits = torch.matmul(
+                    grounding_text, grounding_none
+                ).unsqueeze(-1)
+                return torch.cat([image_logits, none_logits], dim=-1) / max(
+                    float(self.llm_grounding_temperature), 1e-6
+                )
+
+            grounding_logits = compute_grounding_logits(text_seq, raw_cls_tokens)
+            if self.llm_grounding_detach_backbone:
+                # The LLM teaches the small selector head without pulling the
+                # shared NER/image encoders away from their supervised task.
+                grounding_loss_text, grounding_loss_images = (
+                    _grounding_features_for_loss(
+                        text_seq, raw_cls_tokens, detach_backbone=True
+                    )
+                )
+                grounding_loss_logits = compute_grounding_logits(
+                    grounding_loss_text, grounding_loss_images
+                )
+            else:
+                grounding_loss_logits = grounding_logits
 
             valid_grounding_candidates = torch.cat(
                 [
@@ -681,9 +717,9 @@ class AgvsMnerModel(nn.Module):
                 and llm_grounding_weights is not None
                 and self.llm_grounding_loss_weight > 0
             ):
-                assert grounding_logits is not None
+                assert grounding_loss_logits is not None
                 grounding_loss = _masked_grounding_loss(
-                    grounding_logits,
+                    grounding_loss_logits,
                     image_mask_bool,
                     llm_grounding_targets,
                     llm_grounding_weights,

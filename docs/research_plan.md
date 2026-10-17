@@ -10,7 +10,7 @@ LLM 仍然包含数据集标注没有提供的信息：一个正确实体由哪�
 
 对训练集中的教师实体 `e=(start,end,type,confidence,image_ids)` 定义可靠性门：
 
-`z_e = 1[教师 span/type 与 gold 实体完全一致] * 1[confidence >= tau] * 1[至少一张证据图有效]`
+`z_e = 1[教师 span/type 与 gold 实体完全一致] * 1[confidence >= tau] * 1[所选证据槽位有效]`
 
 只有 `z_e=1` 的实体进入辅助任务。教师目标是五路分布 `q_e=[img0,img1,img2,img3,NONE]`；空 `image_ids` 对应 NONE，明确教授学生何时不应使用视觉信息。学生把实体中每个词的首个 WordPiece 表征 `h_i` 与四张图的原始 ViT CLS 表征 `v_m` 投影到同一空间，避免从图像槽位嵌入中走捷径：
 
@@ -22,7 +22,7 @@ LLM 仍然包含数据集标注没有提供的信息：一个正确实体由哪�
 
 `h'_i = LayerNorm(h_i + visual_strength * gate_i * (AGVS_i + tanh(alpha) * W_g g_i))`
 
-其中 `p(NONE)` 自动吸收不需要视觉证据的概率质量。辅助头不只是训练时旁路，推理时学生仍会自行预测实体相关图片并控制视觉融合。
+其中 `p(NONE)` 自动吸收不需要视觉证据的概率质量。为解决第一版实验中共享辅助梯度造成的负迁移，正式模型增加两项保护：非实体词接受总质量受限的弱 NONE 监督，使背景 token 在推理时关闭视觉残差；教师 grounding 损失默认使用 detach 后的 BERT/ViT 特征，只更新证据选择头。视觉残差系数从 0 初始化，NER 主损失可在证据有用时自行增大它。辅助头不只是训练时旁路，推理时学生仍会自行预测实体相关图片并控制视觉融合。
 
 Grounding 损失为：
 
@@ -34,7 +34,7 @@ Grounding 损失为：
 
 `L = L_CRF + lambda_ground * L_ground`
 
-默认 `tau=0.7`、`T=0.1`、`lambda_ground=0.1`。原始 token KL 与全局 image KL 默认权重均为 0，仅保留作消融。门控使用的 gold 只来自训练集，验证与测试不产生教师损失；部署时不调用 LLM。
+默认 `tau=0.9`、`T=0.1`、`lambda_ground=0.1`，背景 NONE 总权重为实体监督质量的 0.25。原始 token KL 与全局 image KL 默认权重均为 0，仅保留作消融。门控使用的 gold 只来自训练集，验证与测试不产生教师损失；部署时不调用 LLM。
 
 ## 核心贡献表述
 
@@ -56,7 +56,11 @@ Grounding 损失为：
 
 主方法先固定同一 seed、batch size 和学习率，搜索 `lambda_ground={0.02,0.05,0.1,0.2}` 与 `tau={0.5,0.7,0.8}`。选择只能依据验证集 F1，测试集只在配置确定后运行一次。至少报告 3 个随机种子的均值和标准差。
 
-附加消融：自由 MNER 缓存 vs gold-conditioned grounding、去掉 confidence gate、使用 `--no-llm-grounding-fusion` 让辅助头不进入融合、去掉 NONE、把实体级 target 换成全局 image score、随机打乱教师 image_ids、固定 slot-0、CLIP 图文相似度教师，以及按实体类型和图片数量分组报告 F1。正式实验还应加入图片顺序置换一致性，并至少人工核查 100–200 个实体的图片证据。
+附加消融：自由 MNER 缓存 vs gold-conditioned grounding、去掉 confidence gate、使用 `--no-llm-grounding-fusion` 让辅助头不进入融合、使用 `--no-llm-grounding-detach-backbone` 恢复共享梯度、将 background ratio 设为 0、去掉 NONE、把实体级 target 换成全局 image score、随机打乱教师 image_ids、固定 slot-0、CLIP 图文相似度教师，以及按实体类型和图片数量分组报告 F1。正式实验还应加入图片顺序置换一致性，并至少人工核查 100–200 个实体的图片证据。
+
+## 已观察到的负结果
+
+在 UNI、seed 1234、batch size 4 上，第一版直接融合取得测试 F1 0.8286；关闭融合但保留共享 grounding 梯度取得 0.8260，均未超过 0.8318 基线。该结果表明问题不只来自融合残差，grounding 辅助梯度本身也会使共享表示偏离 NER 目标。因此后续主实验必须使用梯度隔离、背景 NONE 门控和零初始化残差，并将旧实现作为负迁移消融完整报告。
 
 ## 训练前审计
 
