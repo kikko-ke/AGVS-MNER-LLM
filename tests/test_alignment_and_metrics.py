@@ -127,3 +127,54 @@ def test_epoch_metrics_use_the_same_seqeval_f1_as_the_report():
     assert metrics["f1"] == 1.0
     assert "1.0000" in metrics["report"]
     assert "_" not in metrics["report"]
+
+
+class GradientIsolationModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.main = torch.nn.Parameter(torch.zeros(2))
+        self.grounding_text_proj = torch.nn.Linear(1, 1, bias=False)
+
+
+def test_gradient_clipping_isolates_auxiliary_teacher_head():
+    trainer = object.__new__(NerTrainer)
+    trainer.model = GradientIsolationModel()
+    trainer.args = SimpleNamespace(max_grad_norm=1.0)
+    trainer.model.main.grad = torch.tensor([3.0, 4.0])
+    trainer.model.grounding_text_proj.weight.grad = torch.tensor([[100.0]])
+
+    trainer._clip_gradients()
+
+    assert torch.isclose(trainer.model.main.grad.norm(), torch.tensor(1.0))
+    assert torch.isclose(
+        trainer.model.grounding_text_proj.weight.grad.norm(), torch.tensor(1.0)
+    )
+
+
+def test_utility_gate_activates_only_after_selector_warmup():
+    trainer = object.__new__(NerTrainer)
+    trainer.model = SimpleNamespace(
+        llm_utility_gate=True,
+        llm_utility_gate_active=True,
+        utility_gate_scale=torch.nn.Parameter(torch.tensor(0.7)),
+    )
+    trainer.args = SimpleNamespace(llm_utility_gate_warmup_epochs=2)
+    trainer.logger = logging.getLogger(__name__)
+
+    trainer._configure_utility_gate_for_epoch(1)
+    assert trainer.model.llm_utility_gate_active is False
+    assert torch.isclose(
+        trainer.model.utility_gate_scale.detach(), torch.tensor(0.7)
+    )
+
+    trainer._configure_utility_gate_for_epoch(3)
+    assert trainer.model.llm_utility_gate_active is True
+    assert float(trainer.model.utility_gate_scale.detach()) == 0.0
+
+    trainer.best_dev_epoch = 2
+    trainer._restore_utility_gate_for_best_checkpoint()
+    assert trainer.model.llm_utility_gate_active is False
+
+    trainer.best_dev_epoch = 3
+    trainer._restore_utility_gate_for_best_checkpoint()
+    assert trainer.model.llm_utility_gate_active is True

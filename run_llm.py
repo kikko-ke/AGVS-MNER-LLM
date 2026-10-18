@@ -107,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Initial utility-gate strength; zero exactly reproduces the AGVS path",
     )
+    parser.add_argument(
+        "--llm-utility-gate-warmup-epochs",
+        type=int,
+        default=2,
+        help="Train the utility selector before allowing it to alter NER visual features",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +142,8 @@ def main() -> None:
         raise ValueError("--llm-utility-threshold must be in [0, 1]")
     if args.llm_utility_gate and args.teacher_cache_task != "utility":
         raise ValueError("--llm-utility-gate requires --teacher-cache-task utility")
+    if args.llm_utility_gate_warmup_epochs < 0:
+        raise ValueError("--llm-utility-gate-warmup-epochs must be non-negative")
     configure_logging(args.output_dir)
     set_seed(args.seed)
 

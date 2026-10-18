@@ -22,6 +22,14 @@ from tqdm.auto import tqdm
 from transformers.optimization import get_linear_schedule_with_warmup
 
 
+_AUXILIARY_GROUNDING_PARAMETERS = (
+    "grounding_text_proj.",
+    "grounding_image_proj.",
+    "grounding_none",
+    "grounding_fusion_proj.",
+)
+
+
 class NerTrainer:
     """Train, validate, checkpoint, and test a multimodal NER model."""
 
@@ -190,7 +198,7 @@ class NerTrainer:
 
                 if training:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                    self._clip_gradients()
                     assert self.optimizer is not None
                     self.optimizer.step()
                     self.scheduler.step()
@@ -232,12 +240,66 @@ class NerTrainer:
             },
         }
 
+    def _clip_gradients(self) -> None:
+        """Clip NER and detached teacher-head gradients independently.
+
+        The auxiliary grounding head can have a much larger gradient norm than
+        the main task. Including it in one global norm silently scales down the
+        otherwise detached BERT/ViT/CRF gradients and breaks the baseline control.
+        """
+        main_parameters = []
+        auxiliary_parameters = []
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is None:
+                continue
+            if name.startswith(_AUXILIARY_GROUNDING_PARAMETERS):
+                auxiliary_parameters.append(parameter)
+            else:
+                main_parameters.append(parameter)
+        if main_parameters:
+            torch.nn.utils.clip_grad_norm_(
+                main_parameters, self.args.max_grad_norm
+            )
+        if auxiliary_parameters:
+            torch.nn.utils.clip_grad_norm_(
+                auxiliary_parameters, self.args.max_grad_norm
+            )
+
+    def _configure_utility_gate_for_epoch(self, epoch: int) -> None:
+        if not getattr(self.model, "llm_utility_gate", False):
+            return
+        warmup_epochs = int(
+            getattr(self.args, "llm_utility_gate_warmup_epochs", 2)
+        )
+        active = epoch > warmup_epochs
+        if active and epoch == warmup_epochs + 1:
+            parameter = getattr(self.model, "utility_gate_scale", None)
+            if parameter is not None:
+                with torch.no_grad():
+                    parameter.zero_()
+        self.model.llm_utility_gate_active = active
+        self.logger.info(
+            "Utility gate %s at epoch %d (selector warmup: %d epochs)",
+            "active" if active else "inactive",
+            epoch,
+            warmup_epochs,
+        )
+
+    def _restore_utility_gate_for_best_checkpoint(self) -> None:
+        if not getattr(self.model, "llm_utility_gate", False):
+            return
+        warmup_epochs = int(
+            getattr(self.args, "llm_utility_gate_warmup_epochs", 2)
+        )
+        self.model.llm_utility_gate_active = self.best_dev_epoch > warmup_epochs
+
     def train(self) -> None:
         self._configure_optimization()
         self.logger.info("Training outputs will be written to %s", self.run_directory)
         progress_bar = tqdm(total=self.train_num_steps, desc="Training")
 
         for epoch in range(1, self.args.num_epochs + 1):
+            self._configure_utility_gate_for_epoch(epoch)
             self.logger.info("Starting epoch %d/%d", epoch, self.args.num_epochs)
             train_metrics = self._run_epoch(
                 self.train_data, training=True, progress_bar=progress_bar
@@ -296,6 +358,7 @@ class NerTrainer:
 
     def test(self) -> None:
         self.model.load_state_dict(torch.load(self.checkpoint_path, map_location=self.args.device))
+        self._restore_utility_gate_for_best_checkpoint()
         self.model.to(self.args.device)
         self.logger.info("Evaluating the best checkpoint on the test set.")
         metrics = self._run_epoch(self.test_data, training=False)

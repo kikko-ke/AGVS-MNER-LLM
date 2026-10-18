@@ -261,6 +261,9 @@ class AgvsMnerModel(nn.Module):
         self.llm_grounding_temperature = getattr(args, "llm_grounding_temperature", 0.1)
         self.llm_grounding_fusion = getattr(args, "llm_grounding_fusion", True)
         self.llm_utility_gate = getattr(args, "llm_utility_gate", False)
+        self.llm_utility_gate_active = self.llm_utility_gate and getattr(
+            args, "llm_utility_gate_warmup_epochs", 2
+        ) == 0
         self.llm_grounding_detach_backbone = getattr(
             args, "llm_grounding_detach_backbone", True
         )
@@ -651,7 +654,11 @@ class AgvsMnerModel(nn.Module):
             cv = cv + torch.tanh(
                 self.grounding_fusion_scale
             ) * grounding_visual_context
-        if grounding_probabilities is not None and self.llm_utility_gate:
+        if (
+            grounding_probabilities is not None
+            and self.llm_utility_gate
+            and self.llm_utility_gate_active
+        ):
             cv = _apply_visual_utility_gate(
                 cv,
                 grounding_probabilities,

@@ -9,7 +9,7 @@
 1. 离线教师比较“只看文本”和“文本加图像”两种实体分类条件，输出 `text_sufficient`、`visual_utility`、真正提供额外消歧信息的图片编号及判断置信度。
 2. 训练集标注只负责可靠性门控：教师实体必须与 gold 的边界和类型完全一致，并超过置信度阈值；教师不能改变 NER 标签。
 3. 连续效用被编码为四个图片槽位加 NONE 的软目标。文本已经充分、视觉效用低或没有有用图片时都监督 NONE；背景词接受弱 NONE 监督。
-4. 教师损失只更新效用选择头。学生用预测的 NONE 概率抑制原 AGVS 视觉分支，门控强度从零开始，初始模型严格等于基线。
+4. 教师损失只更新效用选择头，并与NER参数分组裁剪梯度。选择头先预热两轮，随后学生才用预测的 NONE 概率抑制原 AGVS 视觉分支；门控强度从零开始，初始模型严格等于基线。
 5. 部署时不需要调用 LLM，只有训练好的学生模型参与预测。
 
 这避免了低质量教师 BIO 预测直接污染 NER 监督，并把 LLM 的作用集中在它相对有价值的跨图像证据判断上。教师模型可以使用 Qwen2.5-VL、Qwen3-VL、InternVL 或任意兼容 OpenAI Chat Completions 的视觉语言模型。旧的 token KL 和全局 image KL 仍保留用于消融，但默认关闭。
@@ -46,7 +46,7 @@ AGVS-MNER-LLM/
 
     python scripts/audit_llm_grounding.py --teacher-task utility --utility-threshold 0.5 --input D:\code\pycharmProjects\AGVS-MNER\dataset\text\MNER-UNI_train.txt --cache .\teacher_cache\qwen_utility\MNER-UNI_train.jsonl --image-root D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter-image-root D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images
 
-    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache\qwen_utility --teacher-cache-task utility --device cuda --llm-token-loss-weight 0 --llm-image-loss-weight 0 --llm-grounding-loss-weight 0.1 --llm-grounding-confidence 0.9 --llm-utility-threshold 0.5 --llm-grounding-background-ratio 0.25 --llm-grounding-detach-backbone --no-llm-grounding-fusion --llm-utility-gate --llm-utility-gate-init 0
+    python run_llm.py --dataset UNI --data-path D:\code\pycharmProjects\AGVS-MNER\dataset\text --image-path D:\code\pycharmProjects\AGVS-MNER\dataset\images --twitter2017-image-path D:\code\pycharmProjects\AGVS-MNER\dataset\twitter2017_images --bert-model ..\pretrained_models\bert-base-uncased --vit-model ..\pretrained_models\ViTB-16 --teacher-cache .\teacher_cache\qwen_utility --teacher-cache-task utility --device cuda --llm-token-loss-weight 0 --llm-image-loss-weight 0 --llm-grounding-loss-weight 0.1 --llm-grounding-confidence 0.9 --llm-utility-threshold 0.5 --llm-grounding-background-ratio 0.25 --llm-grounding-detach-backbone --no-llm-grounding-fusion --llm-utility-gate --llm-utility-gate-init 0 --llm-utility-gate-warmup-epochs 2
 
 缓存生成是离线步骤，训练循环不会请求外部 LLM。若不提供缓存，直接运行原始 run.py 即可得到 AGVS 基线。
 启用 grounding loss 时，训练入口会检查缓存任务、文件存在性和可用实体数，避免因路径或阈值错误静默退化成普通基线。旧缓存可用 `--teacher-cache-task mner` 做先导实验，但其中的 confidence 含义不同，不作为正式主结果。

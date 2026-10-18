@@ -19,6 +19,7 @@ distillation:
   grounding_fusion: false
   utility_gate: true
   utility_gate_init: 0.0
+  utility_gate_warmup_epochs: 2
   grounding_class_balance: true
   max_seq_length: 64
   max_images: 4
