@@ -158,7 +158,10 @@ def test_utility_gate_activates_only_after_selector_warmup():
         llm_utility_gate_active=True,
         utility_gate_scale=torch.nn.Parameter(torch.tensor(0.7)),
     )
-    trainer.args = SimpleNamespace(llm_utility_gate_warmup_epochs=2)
+    trainer.args = SimpleNamespace(
+        llm_utility_gate_warmup_epochs=2,
+        llm_utility_gate_init=0.1,
+    )
     trainer.logger = logging.getLogger(__name__)
 
     trainer._configure_utility_gate_for_epoch(1)
@@ -169,7 +172,9 @@ def test_utility_gate_activates_only_after_selector_warmup():
 
     trainer._configure_utility_gate_for_epoch(3)
     assert trainer.model.llm_utility_gate_active is True
-    assert float(trainer.model.utility_gate_scale.detach()) == 0.0
+    assert torch.isclose(
+        trainer.model.utility_gate_scale.detach(), torch.tensor(0.1)
+    )
 
     trainer.best_dev_epoch = 2
     trainer._restore_utility_gate_for_best_checkpoint()
@@ -178,3 +183,22 @@ def test_utility_gate_activates_only_after_selector_warmup():
     trainer.best_dev_epoch = 3
     trainer._restore_utility_gate_for_best_checkpoint()
     assert trainer.model.llm_utility_gate_active is True
+
+
+def test_utility_gate_projection_prevents_negative_gradient_dead_zone():
+    trainer = object.__new__(NerTrainer)
+    trainer.model = SimpleNamespace(
+        llm_utility_gate=True,
+        utility_gate_scale=torch.nn.Parameter(torch.tensor(-0.2)),
+    )
+
+    trainer._project_constrained_controls()
+
+    assert float(trainer.model.utility_gate_scale.detach()) == 0.0
+
+    with torch.no_grad():
+        trainer.model.utility_gate_scale.fill_(0.3)
+    trainer._project_constrained_controls()
+    assert torch.isclose(
+        trainer.model.utility_gate_scale.detach(), torch.tensor(0.3)
+    )

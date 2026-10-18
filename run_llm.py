@@ -144,6 +144,8 @@ def main() -> None:
         raise ValueError("--llm-utility-gate requires --teacher-cache-task utility")
     if args.llm_utility_gate_warmup_epochs < 0:
         raise ValueError("--llm-utility-gate-warmup-epochs must be non-negative")
+    if args.llm_utility_gate_init < 0:
+        raise ValueError("--llm-utility-gate-init must be non-negative")
     configure_logging(args.output_dir)
     set_seed(args.seed)
 

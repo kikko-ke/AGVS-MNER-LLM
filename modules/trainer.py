@@ -201,6 +201,7 @@ class NerTrainer:
                     self._clip_gradients()
                     assert self.optimizer is not None
                     self.optimizer.step()
+                    self._project_constrained_controls()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     if progress_bar is not None:
@@ -276,7 +277,9 @@ class NerTrainer:
             parameter = getattr(self.model, "utility_gate_scale", None)
             if parameter is not None:
                 with torch.no_grad():
-                    parameter.zero_()
+                    parameter.fill_(
+                        float(getattr(self.args, "llm_utility_gate_init", 0.0))
+                    )
         self.model.llm_utility_gate_active = active
         self.logger.info(
             "Utility gate %s at epoch %d (selector warmup: %d epochs)",
@@ -284,6 +287,24 @@ class NerTrainer:
             epoch,
             warmup_epochs,
         )
+
+    def _project_constrained_controls(self) -> None:
+        """Keep one-sided controls on a trainable boundary.
+
+        The utility gate may suppress vision but may not amplify it.  Its forward
+        transform therefore clamps negative raw values to zero.  Without this
+        projection, one negative optimizer step moves the parameter into the
+        clamp's zero-gradient region and the gate can never recover.  Projecting
+        after every update preserves the exact zero-strength baseline while
+        allowing later batches to move the parameter back into the positive
+        region.
+        """
+        if not getattr(self.model, "llm_utility_gate", False):
+            return
+        parameter = getattr(self.model, "utility_gate_scale", None)
+        if parameter is not None:
+            with torch.no_grad():
+                parameter.clamp_(min=0.0)
 
     def _restore_utility_gate_for_best_checkpoint(self) -> None:
         if not getattr(self.model, "llm_utility_gate", False):
