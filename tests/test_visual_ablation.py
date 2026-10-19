@@ -6,7 +6,10 @@ from pathlib import Path
 
 import torch
 
-from scripts.evaluate_visual_ablation import ImageMaskOverrideDataset
+from scripts.evaluate_visual_ablation import (
+    ImageMaskOverrideDataset,
+    ShuffledImageDataset,
+)
 
 
 class _SingleSampleDataset:
@@ -33,6 +36,43 @@ def test_text_only_ablation_changes_only_the_image_mask() -> None:
     for original_value, ablated_value in zip(original[:-1], ablated[:-1]):
         assert torch.equal(original_value, ablated_value)
     assert ablated[-1].tolist() == [0, 0, 0, 0]
+
+
+class _ShuffleDataset:
+    def __init__(self) -> None:
+        self.masks = (
+            torch.tensor([1, 0, 0, 0]),
+            torch.tensor([1, 0, 0, 0]),
+            torch.tensor([1, 1, 0, 0]),
+            torch.tensor([1, 1, 0, 0]),
+        )
+
+    def __len__(self) -> int:
+        return len(self.masks)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.tensor([101, 102]),
+            torch.zeros(2, dtype=torch.long),
+            torch.ones(2, dtype=torch.long),
+            torch.full((4, 3, 2, 2), float(index)),
+            torch.zeros(2, dtype=torch.long),
+            self.masks[index],
+        )
+
+
+def test_shuffled_images_preserve_masks_and_replace_content() -> None:
+    base = _ShuffleDataset()
+    shuffled = ShuffledImageDataset(base, seed=1234)
+
+    assert shuffled.changed_samples == len(base)
+    for index in range(len(base)):
+        sample = shuffled[index]
+        donor_index = shuffled.donor_indices[index]
+        assert donor_index != index
+        assert torch.equal(sample[-1], base[index][-1])
+        assert torch.equal(sample[3], base[donor_index][3])
+        assert torch.equal(base[index][-1], base[donor_index][-1])
 
 
 def test_visual_ablation_script_runs_directly() -> None:

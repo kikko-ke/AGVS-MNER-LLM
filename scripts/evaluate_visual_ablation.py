@@ -1,10 +1,12 @@
-"""Compare a checkpoint on full-image and text-only validation views."""
+"""Compare full, text-only, and mask-matched shuffled-image checkpoint views."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +37,44 @@ class ImageMaskOverrideDataset(Dataset[tuple[torch.Tensor, ...]]):
         return tuple(sample)
 
 
+class ShuffledImageDataset(Dataset[tuple[torch.Tensor, ...]]):
+    """Replace image content while preserving every sample's exact image mask."""
+
+    def __init__(
+        self,
+        base: Dataset[tuple[torch.Tensor, ...]],
+        seed: int,
+    ) -> None:
+        self.base = base
+        groups: dict[tuple[int, ...], list[int]] = defaultdict(list)
+        for index in range(len(base)):
+            image_mask = tuple(int(value) for value in base[index][-1].tolist())
+            groups[image_mask].append(index)
+
+        self.donor_indices = list(range(len(base)))
+        for group_number, indices in enumerate(groups.values()):
+            if len(indices) < 2:
+                continue
+            ordered = list(indices)
+            random.Random(seed + group_number).shuffle(ordered)
+            rotated = ordered[1:] + ordered[:1]
+            for target, donor in zip(ordered, rotated):
+                self.donor_indices[target] = donor
+
+        self.changed_samples = sum(
+            donor != index for index, donor in enumerate(self.donor_indices)
+        )
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        sample = list(self.base[index])
+        donor = self.base[self.donor_indices[index]]
+        sample[3] = donor[3]
+        return tuple(sample)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -42,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--shuffle-seed", type=int, default=20261019)
     return parser.parse_args()
 
 
@@ -108,10 +149,18 @@ def main() -> None:
         "num_workers": int(getattr(args, "num_workers", 0)),
         "shuffle": False,
     }
-    results: dict[str, dict[str, float]] = {}
+    shuffled_dataset = ShuffledImageDataset(dataset, seed=cli.shuffle_seed)
+    results: dict[str, Any] = {
+        "shuffle": {
+            "seed": cli.shuffle_seed,
+            "changed_samples": shuffled_dataset.changed_samples,
+            "total_samples": len(shuffled_dataset),
+        }
+    }
     for mode, mode_dataset in (
         ("full", dataset),
         ("text_only", ImageMaskOverrideDataset(dataset)),
+        ("shuffled_images", shuffled_dataset),
     ):
         metrics = evaluator._run_epoch(
             DataLoader(mode_dataset, **loader_options),
@@ -129,7 +178,13 @@ def main() -> None:
     results["comparison"] = {
         "full_minus_text_only_f1": (
             results["full"]["f1"] - results["text_only"]["f1"]
-        )
+        ),
+        "full_minus_shuffled_images_f1": (
+            results["full"]["f1"] - results["shuffled_images"]["f1"]
+        ),
+        "shuffled_images_minus_text_only_f1": (
+            results["shuffled_images"]["f1"] - results["text_only"]["f1"]
+        ),
     }
     print("\n=== summary ===")
     print(json.dumps(results, ensure_ascii=False, indent=2))
