@@ -6,6 +6,7 @@ from models.agvs_mner import (
     _apply_visual_utility_gate,
     _grounding_features_for_loss,
     _masked_grounding_loss,
+    _prepare_image_cls_tokens,
 )
 from modules.llm_dataset import build_grounding_targets, extract_bio_entities
 
@@ -181,6 +182,28 @@ def test_grounding_loss_can_detach_shared_encoder_features():
     )
     assert live_text is text
     assert live_images is images
+
+
+def test_teacher_mask_does_not_change_legacy_all_invalid_image_path():
+    raw_cls_tokens = torch.tensor(
+        [[[2.0, 3.0], [5.0, 7.0], [11.0, 13.0], [17.0, 19.0]]]
+    )
+    image_mask = torch.tensor([[0, 0, 0, 0]])
+    safe_image_mask = torch.tensor([[1, 0, 0, 0]])
+    slot_embeddings = torch.tensor(
+        [[[0.5, 1.0], [1.5, 2.0], [2.5, 3.0], [3.5, 4.0]]]
+    )
+
+    cls_tokens, grounding_cls_tokens = _prepare_image_cls_tokens(
+        raw_cls_tokens,
+        image_mask,
+        safe_image_mask,
+        slot_embeddings,
+    )
+
+    assert torch.equal(cls_tokens[0, 0], torch.tensor([2.5, 4.0]))
+    assert cls_tokens[0, 1:].count_nonzero() == 0
+    assert grounding_cls_tokens.count_nonzero() == 0
 
 
 def test_visual_utility_targets_encode_additional_value_and_text_sufficiency():

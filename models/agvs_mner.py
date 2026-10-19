@@ -71,6 +71,26 @@ def _grounding_features_for_loss(
     return text_features, image_features
 
 
+def _prepare_image_cls_tokens(
+    raw_cls_tokens: torch.Tensor,
+    image_mask: torch.Tensor,
+    safe_image_mask: torch.Tensor,
+    slot_embeddings: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the legacy AGVS path while masking teacher-only image features.
+
+    AGVS promotes slot zero to a safe placeholder when every source image is
+    unavailable.  The main visual path must therefore retain that placeholder's
+    ViT CLS feature.  Teacher grounding, however, must never treat a missing
+    image slot as evidence, so it receives a separately masked copy.
+    """
+    grounding_cls_tokens = raw_cls_tokens * image_mask.bool().unsqueeze(-1).float()
+    cls_tokens = (raw_cls_tokens + slot_embeddings) * (
+        safe_image_mask.bool().unsqueeze(-1).float()
+    )
+    return cls_tokens, grounding_cls_tokens
+
+
 def _apply_visual_utility_gate(
     visual_context: torch.Tensor,
     grounding_probabilities: torch.Tensor,
@@ -469,8 +489,6 @@ class AgvsMnerModel(nn.Module):
             image_count,
             self.hidden_size
         )
-        raw_cls_tokens = raw_cls_tokens * image_mask_bool.unsqueeze(-1).float()
-        cls_tokens = raw_cls_tokens
 
         patch_tokens = vit_seq[:, 1:, :].reshape(
             batch_size,
@@ -484,8 +502,12 @@ class AgvsMnerModel(nn.Module):
         )
         temporal_embeddings = self.slot_embedding(temporal_position_ids)
 
-        cls_tokens = cls_tokens + temporal_embeddings
-        cls_tokens = cls_tokens * safe_image_mask.unsqueeze(-1).float()
+        cls_tokens, grounding_cls_tokens = _prepare_image_cls_tokens(
+            raw_cls_tokens,
+            image_mask_bool,
+            safe_image_mask,
+            temporal_embeddings,
+        )
 
         # Sequence modeling over image CLS tokens.
         # Important for single-image samples: padding image positions must not attend.
@@ -526,13 +548,15 @@ class AgvsMnerModel(nn.Module):
                     float(self.llm_grounding_temperature), 1e-6
                 )
 
-            grounding_logits = compute_grounding_logits(text_seq, raw_cls_tokens)
+            grounding_logits = compute_grounding_logits(
+                text_seq, grounding_cls_tokens
+            )
             if self.llm_grounding_detach_backbone:
                 # The LLM teaches the small selector head without pulling the
                 # shared NER/image encoders away from their supervised task.
                 grounding_loss_text, grounding_loss_images = (
                     _grounding_features_for_loss(
-                        text_seq, raw_cls_tokens, detach_backbone=True
+                        text_seq, grounding_cls_tokens, detach_backbone=True
                     )
                 )
                 grounding_loss_logits = compute_grounding_logits(
@@ -560,7 +584,8 @@ class AgvsMnerModel(nn.Module):
             # The missing mass is p(NONE), so this context is automatically
             # suppressed when the student decides that vision is irrelevant.
             grounding_visual_context = torch.bmm(
-                grounding_probabilities[..., :image_count], raw_cls_tokens
+                grounding_probabilities[..., :image_count],
+                grounding_cls_tokens,
             )
             grounding_visual_context = self.grounding_fusion_proj(
                 grounding_visual_context
