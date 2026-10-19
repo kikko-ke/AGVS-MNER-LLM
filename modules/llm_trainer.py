@@ -179,9 +179,18 @@ class LlmNerTrainer(NerTrainer):
             decoded_label_ids, loss, full_features = full_outputs
         else:
             decoded_label_ids, loss = full_outputs
+            if routed_losses_enabled:
+                components = dict(
+                    getattr(self.model, "last_loss_components", {})
+                )
+                components["evidence_route_fraction"] = torch.zeros(
+                    (), device=image_mask.device
+                )
+                self.model.last_loss_components = components
             return attention_mask, labels, decoded_label_ids, loss
 
         components = dict(getattr(self.model, "last_loss_components", {}))
+        components["evidence_route_fraction"] = changed_samples.float().mean().detach()
         cpu_rng_after = torch.get_rng_state()
         cuda_rng_after = (
             torch.cuda.get_rng_state_all() if image_pixel_values.is_cuda else None

@@ -9,6 +9,7 @@ from uuid import uuid4
 import torch
 
 from modules.llm_trainer import (
+    LlmNerTrainer,
     build_evidence_route_mask,
     routed_emission_kl,
     routed_visual_strength,
@@ -200,3 +201,105 @@ def test_epoch_zero_checkpoint_wins_exact_validation_tie():
     save.assert_not_called()
     assert trainer.best_dev_epoch == 0
     assert trainer.patience_counter == 1
+
+
+class _FakeCrf:
+    def __call__(self, emissions, _labels, *, mask, reduction):
+        log_likelihood = -(emissions[..., 0] * mask.float()).sum(dim=1)
+        if reduction == "none":
+            return log_likelihood
+        return log_likelihood.mean()
+
+
+class _TwoViewModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(0.5))
+        self.crf = _FakeCrf()
+        self.calls = []
+        self.last_loss_components = {}
+
+    def forward(
+        self,
+        *,
+        input_ids,
+        image_mask,
+        labels=None,
+        visual_strength_override=None,
+        return_features=False,
+        **_kwargs,
+    ):
+        batch_size, sequence_length = input_ids.shape
+        noise = torch.rand(batch_size, 1, 1)
+        if visual_strength_override is None:
+            strength = image_mask.float().mean(dim=1)
+        else:
+            strength = visual_strength_override
+        emissions = (
+            self.scale * strength.reshape(batch_size, 1, 1) + noise
+        ).expand(batch_size, sequence_length, 3)
+        self.calls.append(
+            {
+                "mask": image_mask.detach().clone(),
+                "noise": noise.detach().clone(),
+                "strength": strength.detach().clone(),
+            }
+        )
+        decoded = [[0] * sequence_length for _ in range(batch_size)]
+        loss = None
+        if labels is not None:
+            loss = emissions.square().mean()
+            self.last_loss_components = {"ner": loss.detach()}
+        if return_features:
+            return decoded, loss, {"token_emissions": emissions}
+        return decoded, loss
+
+
+def test_two_view_step_replays_dropout_and_preserves_visual_strength():
+    trainer = object.__new__(LlmNerTrainer)
+    trainer.model = _TwoViewModel()
+    trainer.model.train()
+    trainer.args = SimpleNamespace(
+        llm_routed_crf_loss_weight=0.5,
+        llm_consistency_kl_weight=0.2,
+        llm_consistency_temperature=2.0,
+    )
+    trainer.label_map = {"O": 0, "B-PER": 1, "X": 2}
+
+    input_ids = torch.tensor([[101, 10, 102]])
+    token_type_ids = torch.zeros_like(input_ids)
+    attention_mask = torch.ones_like(input_ids)
+    image_pixels = torch.zeros((1, 4, 3, 2, 2))
+    labels = torch.tensor([[2, 1, 2]])
+    image_mask = torch.tensor([[1, 1, 1, 0]])
+    token_probs = torch.zeros((1, 3, 3))
+    image_scores = torch.zeros((1, 4))
+    available = torch.zeros(1)
+    grounding_targets = torch.zeros((1, 3, 5))
+    grounding_targets[0, 1, 1] = 1.0
+    grounding_weights = torch.tensor([[0.0, 0.9, 0.0]])
+
+    *_unused, loss = trainer._step(
+        (
+            input_ids,
+            token_type_ids,
+            attention_mask,
+            image_pixels,
+            labels,
+            image_mask,
+            token_probs,
+            image_scores,
+            available,
+            grounding_targets,
+            grounding_weights,
+        )
+    )
+    loss.backward()
+
+    assert len(trainer.model.calls) == 2
+    full_call, routed_call = trainer.model.calls
+    assert torch.equal(full_call["noise"], routed_call["noise"])
+    assert routed_call["mask"].tolist() == [[0, 1, 0, 0]]
+    assert torch.equal(routed_call["strength"], torch.tensor([0.75]))
+    assert trainer.model.scale.grad is not None
+    assert trainer.model.last_loss_components["evidence_route_fraction"] == 1
