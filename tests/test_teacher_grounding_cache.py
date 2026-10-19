@@ -171,3 +171,38 @@ def test_teacher_cache_dataset_builds_five_way_targets_and_summary(tmp_path):
         TeacherCacheDataset(
             TinyBaseDataset(), cache_path, expected_teacher_task="mner"
         )
+
+
+def test_grounding_targets_do_not_depend_on_legacy_kd_tensors(tmp_path):
+    cache_path = tmp_path / "MNER-UNI_train.jsonl"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "sample_id": 0,
+                "teacher_task": "grounding",
+                "entities": [
+                    {
+                        "start": 0,
+                        "end": 1,
+                        "label": "PER",
+                        "image_ids": [0],
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset = TeacherCacheDataset(
+        TinyBaseDataset(),
+        cache_path,
+        expected_teacher_task="grounding",
+        enable_grounding=True,
+    )
+
+    sample = dataset[0]
+
+    assert sample[-3].item() == 0.0
+    assert sample[-2][1].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0]
+    assert torch.isclose(sample[-1][1], torch.tensor(0.9))

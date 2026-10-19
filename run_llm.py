@@ -17,6 +17,7 @@ from models.agvs_mner import AgvsMnerModel
 from modules.dataset import MultimodalNerDataset
 from modules.llm_dataset import TeacherCacheDataset
 from modules.llm_trainer import LlmNerTrainer
+from modules.trainer import load_compatible_model_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +114,34 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Train the utility selector before allowing it to alter NER visual features",
     )
+    parser.add_argument(
+        "--llm-routed-crf-loss-weight",
+        type=float,
+        default=0.0,
+        help="CRF loss weight for the LLM evidence-preserving routed image view",
+    )
+    parser.add_argument(
+        "--llm-consistency-kl-weight",
+        type=float,
+        default=0.0,
+        help="Token-emission KL weight from the detached routed view to the full view",
+    )
+    parser.add_argument(
+        "--llm-consistency-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for routed-to-full token-emission consistency",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="Optional baseline checkpoint used to initialize compatible model parameters",
+    )
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Do not evaluate the test split after training; use for validation-only tuning",
+    )
     return parser.parse_args()
 
 
@@ -146,6 +175,28 @@ def main() -> None:
         raise ValueError("--llm-utility-gate-warmup-epochs must be non-negative")
     if args.llm_utility_gate_init < 0:
         raise ValueError("--llm-utility-gate-init must be non-negative")
+    if args.llm_routed_crf_loss_weight < 0:
+        raise ValueError("--llm-routed-crf-loss-weight must be non-negative")
+    if args.llm_consistency_kl_weight < 0:
+        raise ValueError("--llm-consistency-kl-weight must be non-negative")
+    if args.llm_consistency_temperature <= 0:
+        raise ValueError("--llm-consistency-temperature must be positive")
+    evidence_intervention_enabled = (
+        args.llm_routed_crf_loss_weight > 0
+        or args.llm_consistency_kl_weight > 0
+    )
+    if evidence_intervention_enabled and args.teacher_cache_task not in {
+        "grounding",
+        "utility",
+    }:
+        raise ValueError(
+            "Routed evidence losses require a grounding or utility teacher cache"
+        )
+    if evidence_intervention_enabled and args.llm_grounding_loss_weight > 0:
+        raise ValueError(
+            "Evidence intervention and the legacy grounding selector must be "
+            "isolated; set --llm-grounding-loss-weight 0"
+        )
     configure_logging(args.output_dir)
     set_seed(args.seed)
 
@@ -169,6 +220,9 @@ def main() -> None:
         balance_grounding_classes=args.llm_grounding_class_balance,
         grounding_background_ratio=args.llm_grounding_background_ratio,
         visual_utility_threshold=args.llm_utility_threshold,
+        enable_grounding=(
+            args.llm_grounding_loss_weight > 0 or evidence_intervention_enabled
+        ),
     )
     dev_data = TeacherCacheDataset(
         dev_base,
@@ -183,7 +237,7 @@ def main() -> None:
         enable_grounding=False,
     )
 
-    if args.llm_grounding_loss_weight > 0:
+    if args.llm_grounding_loss_weight > 0 or evidence_intervention_enabled:
         train_cache_path = cache_dir / f"MNER-{args.dataset}_train.jsonl"
         if not train_cache_path.exists():
             raise FileNotFoundError(
@@ -206,6 +260,17 @@ def main() -> None:
 
     label_mapping = train_base.processor.get_label_mapping(include_subword_label=True)
     model = AgvsMnerModel(list(label_mapping), args)
+    if args.init_checkpoint:
+        missing_keys = load_compatible_model_checkpoint(
+            model,
+            args.init_checkpoint,
+            map_location="cpu",
+        )
+        logging.getLogger(__name__).info(
+            "Initialized from %s; retained initialization for optional keys: %s",
+            args.init_checkpoint,
+            missing_keys or "none",
+        )
     trainer = LlmNerTrainer(
         train_loader,
         dev_loader,

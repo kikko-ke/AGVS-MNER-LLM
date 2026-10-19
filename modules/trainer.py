@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,55 @@ _AUXILIARY_GROUNDING_PARAMETERS = (
     "grounding_none",
     "grounding_fusion_proj.",
 )
+
+_OPTIONAL_TEACHER_HEAD_PARAMETERS = (
+    "grounding_text_proj.",
+    "grounding_image_proj.",
+    "grounding_none",
+    "grounding_fusion_proj.",
+    "grounding_fusion_scale",
+    "utility_gate_scale",
+)
+
+
+def load_compatible_model_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> list[str]:
+    """Load a model checkpoint while allowing absent optional LLM heads.
+
+    Baseline checkpoints created before the teacher heads were introduced do
+    not contain those parameters.  Every shared AGVS/NER parameter must still
+    be present, so an unrelated or partial checkpoint fails loudly.
+    """
+    payload = torch.load(checkpoint_path, map_location=map_location)
+    if not isinstance(payload, Mapping):
+        raise TypeError("Checkpoint must contain a model state dictionary")
+    for wrapper_key in ("model_state_dict", "state_dict"):
+        wrapped = payload.get(wrapper_key)
+        if isinstance(wrapped, Mapping):
+            payload = wrapped
+            break
+
+    state = dict(payload)
+    if state and all(str(key).startswith("module.") for key in state):
+        state = {str(key)[7:]: value for key, value in state.items()}
+
+    incompatible = model.load_state_dict(state, strict=False)
+    required_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(_OPTIONAL_TEACHER_HEAD_PARAMETERS)
+    ]
+    if required_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Incompatible initialization checkpoint: "
+            f"missing required keys={required_missing}, "
+            f"unexpected keys={list(incompatible.unexpected_keys)}"
+        )
+    return list(incompatible.missing_keys)
 
 
 class NerTrainer:
@@ -104,6 +154,25 @@ class NerTrainer:
                     f"{train_metrics['f1']:.4f}",
                     f"{train_metrics['precision']:.4f}",
                     f"{train_metrics['recall']:.4f}",
+                    f"{dev_metrics['loss']:.6f}",
+                    f"{dev_metrics['accuracy']:.4f}",
+                    f"{dev_metrics['f1']:.4f}",
+                    f"{dev_metrics['precision']:.4f}",
+                    f"{dev_metrics['recall']:.4f}",
+                ]
+            )
+
+    def _log_initial_results(self, dev_metrics: dict[str, float]) -> None:
+        """Record the epoch-zero full-view checkpoint used as fallback."""
+        with self.results_path.open("a", newline="", encoding="utf-8") as metrics_file:
+            csv.writer(metrics_file).writerow(
+                [
+                    0,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
                     f"{dev_metrics['loss']:.6f}",
                     f"{dev_metrics['accuracy']:.4f}",
                     f"{dev_metrics['f1']:.4f}",
@@ -317,6 +386,20 @@ class NerTrainer:
     def train(self) -> None:
         self._configure_optimization()
         self.logger.info("Training outputs will be written to %s", self.run_directory)
+        use_epoch_zero_fallback = bool(getattr(self.args, "init_checkpoint", None))
+        if use_epoch_zero_fallback:
+            # The intervention is a training-only view.  Evaluate and save the
+            # unmodified full-view model before the first optimizer update so a
+            # harmful intervention can never displace a stronger baseline.
+            self._configure_utility_gate_for_epoch(0)
+            self.logger.info("Evaluating the epoch-zero full-view fallback.")
+            initial_metrics = self.evaluate(0)
+            self._log_initial_results(initial_metrics)
+            self.logger.info(
+                "Epoch-zero fallback dev F1 %.4f saved to %s",
+                initial_metrics["f1"],
+                self.checkpoint_path,
+            )
         progress_bar = tqdm(total=self.train_num_steps, desc="Training")
 
         for epoch in range(1, self.args.num_epochs + 1):
@@ -359,7 +442,12 @@ class NerTrainer:
                 break
 
         progress_bar.close()
-        self.test()
+        if getattr(self.args, "skip_test", False):
+            self.logger.info(
+                "Skipping test evaluation; select all settings using validation results."
+            )
+        else:
+            self.test()
 
     def evaluate(self, epoch: int) -> dict[str, Any]:
         self.logger.info("Evaluating on the validation set.")
@@ -367,7 +455,16 @@ class NerTrainer:
         self.logger.info("Validation results:\n%s", metrics["report"])
         self.logger.info("Validation loss components: %s", metrics["loss_components"])
 
-        if metrics["f1"] >= self.best_dev_f1:
+        protect_epoch_zero_tie = (
+            bool(getattr(self.args, "init_checkpoint", None))
+            and self.best_dev_epoch == 0
+        )
+        improved = (
+            metrics["f1"] > self.best_dev_f1
+            if protect_epoch_zero_tie
+            else metrics["f1"] >= self.best_dev_f1
+        )
+        if improved:
             self.best_dev_f1 = metrics["f1"]
             self.best_dev_epoch = epoch
             self.patience_counter = 0

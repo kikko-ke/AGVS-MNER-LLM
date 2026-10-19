@@ -402,6 +402,7 @@ class AgvsMnerModel(nn.Module):
         token_type_ids=None,
         image_pixel_values=None,
         image_mask=None,
+        visual_strength_override=None,
         labels=None,
         llm_token_probs=None,
         llm_image_scores=None,
@@ -677,7 +678,22 @@ class AgvsMnerModel(nn.Module):
         gate_input = torch.cat([text_seq, V_global_expanded], dim=-1)
         gate = torch.sigmoid(self.img_gate(gate_input))
 
-        visual_strength = (real_image_count / float(self.num_images)).unsqueeze(-1)
+        if visual_strength_override is None:
+            visual_strength = (
+                real_image_count / float(self.num_images)
+            ).unsqueeze(-1)
+        else:
+            visual_strength = torch.as_tensor(
+                visual_strength_override,
+                dtype=text_seq.dtype,
+                device=device,
+            )
+            if visual_strength.numel() != batch_size:
+                raise ValueError(
+                    "visual_strength_override must contain one value per sample"
+                )
+            visual_strength = visual_strength.reshape(batch_size, 1, 1)
+            visual_strength = visual_strength.clamp(min=0.0, max=1.0)
         if self.training and self.image_dropout_prob > 0:
             keep_visual = (
                 torch.rand(batch_size, 1, 1, device=device) >= self.image_dropout_prob

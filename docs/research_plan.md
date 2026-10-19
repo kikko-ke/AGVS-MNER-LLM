@@ -1,82 +1,86 @@
-# 研究计划：C-VUG（Counterfactual Visual Utility Gating）
+# 研究计划：LGEI（LLM-Guided Evidence Intervention）
 
-## 动机
+## 问题诊断
 
-现有 Qwen3-VL 教师在训练缓存上的实体 F1 只有 0.5060。直接对全部 token 做 KL 蒸馏会把错误边界、错误类型和过多的非实体预测传给学生；已有实验中 Full KD（0.8318）没有超过同配置的无教师基线（0.8324）。
+严格修复 WordPiece 对齐和评估口径后，AGVS 在 UNI 上取得约 0.8257 验证 F1 和 0.8318 测试 F1。已有三类 LLM 方案没有形成稳定增益：
 
-后续消融进一步表明“实体由哪张图描绘”也不足以提升 NER：分离梯度的 G-MEG v2 最佳验证 F1 为 0.8203，关闭其融合后为 0.8208，均低于 0.8257 基线。原因是视觉相关性不等于视觉增量价值。C-VUG 因此让 VLM 比较只看文本与加入图像两种条件，只监督图片是否提供额外的实体类型消歧信息。
+- 原始教师实体预测 F1 约 0.506，直接 token KD 会传播边界与类型错误。
+- grounding selector 主要学习“图片是否描绘实体”，不等于图片是否帮助 NER；其融合和辅助梯度实验低于基线。
+- 998 条 utility pilot 是连续 sample ID 0--999，完全没有覆盖 Twitter2017 域；当前 gate 又只消费 `p(NONE)`，没有直接使用教师 `image_ids`。其 0.8321 测试 F1 与 0.8318 基线相当，但验证 F1 更低，不能视为增益。
 
-正式缓存使用 `--teacher-task utility`，把训练集 gold 实体交给 VLM。教师输出 `text_sufficient`、连续 `visual_utility` 和有额外价值的图片编号，不预测或修改 BIO 标签。
+现有完整 grounding 缓存覆盖 10,227/10,229 个训练样本和几乎全部 gold 实体，且包含具体图片编号。LGEI 直接利用这份覆盖完整的训练期特权信息，不再训练弱测试时路由器。
 
 ## 方法
 
-对训练集中的教师实体 `e=(start,end,type,confidence,text_sufficient,visual_utility,image_ids)` 定义可靠性门：
+教师实体为 `e=(start,end,type,confidence,image_ids)`。可靠性门只接受满足以下条件的实体：
 
-`z_e = 1[教师 span/type 与 gold 实体完全一致] * 1[confidence >= tau] * 1[所选证据槽位有效]`
+`z_e = 1[span/type 与 gold 完全一致] * 1[confidence >= tau] * 1[图片槽位有效]`
 
-只有 `z_e=1` 的实体进入辅助任务。教师目标是五路分布 `q_e=[img0,img1,img2,img3,NONE]`。文本充分或效用低于阈值时 `q(NONE)=1`；否则总计 `visual_utility` 的概率分配给有用图片，剩余概率分配给 NONE。学生把实体中每个词的首个 WordPiece 表征 `h_i` 与四张图的原始 ViT CLS 表征 `v_m` 投影到同一空间：
+对样本 `x`，将所有可靠实体的 `image_ids` 取并集得到证据集合 `S(x)`：
 
-`p(m|i) = softmax([cos(W_t h_i, W_v v_0..3), s_NONE] / T)`
+- `S(x)` 非空：routed view 仅保留证据图片；
+- 存在可靠实体但所有实体均为 `NONE`：routed view 关闭视觉分支；
+- 没有可靠实体：不实施干预，继续使用完整视图。
 
-预测的 NONE 概率控制原 AGVS 视觉分支：
+完整视图和 routed view 使用同一个学生参数。两个前向保持 batch 形状相同并复用 CPU/CUDA RNG 状态，使 dropout 与 image dropout 的随机变量一致。对于非空 route，视觉融合强度沿用完整视图的有效图片比例；因此干预改变的是证据内容，不混入图片数量造成的额外幅度衰减。
 
-`AGVS'_i = (1 - clamp(tanh(beta),0,1) * stopgrad(p(NONE|i))) * AGVS_i`
+设 `p_f`、`p_r` 为完整视图和 routed view 的 token emissions，`M_e` 为被教师覆盖且 route 确实发生变化的实体首 WordPiece：
 
-`h'_i = LayerNorm(h_i + visual_strength * gate_i * AGVS'_i)`
+`L = L_CRF(full) + lambda_r L_CRF(routed) + lambda_k T^2 sum_(i in M_e) w_i KL(stopgrad(p_r_i/T) || p_f_i/T)`
 
-其中 `beta` 从 0 初始化，初始前向路径严格等于 AGVS。效用 posterior 在门控处停止梯度，防止 NER 目标覆盖教师语义；教师损失也使用 detach 后的 BERT/ViT 特征，只更新效用选择头。辅助头与NER参数独立裁剪梯度，避免大辅助梯度间接缩小NER更新。选择头默认预热两轮后才开放门控，NER只决定抑制强度 `beta`。非实体词接受总质量受限的弱 NONE 监督。推理时不调用 LLM，由学生自行预测视觉效用。
+默认 `tau=0.9`、`lambda_r=0.5`、`lambda_k=0.2`、`T=2`。routed CRF 让模型在去除干扰图后学习 gold 序列；KL 把这一更干净视图的实体判断蒸馏回完整视图。推理只执行完整视图一次，不需要 LLM、缓存或路由器。
 
-Grounding 损失为：
+该实现是样本级 evidence intervention：多实体样本共享教师证据图片的并集。论文不得将它表述为严格逐实体前向路由。
 
-`L_ground = - sum_i w_i * sum_m q_i,m log p(m|i) / sum_i w_i`
+## 安全微调
 
-同一实体的 token 权重之和等于“教师置信度 × 类别权重”，避免多词实体仅因长度获得更大损失。默认类别权重按训练集实体频次的逆平方根计算并截断到 2.0，减少 PER 对辅助任务的支配；必须报告关闭该权重的消融。
+主实验从严格基线 `best_model.pt` 开始，以较低学习率微调 3--5 个 epoch。训练器在任何更新前先评估 epoch 0 并保存 checkpoint；后续验证 F1 没有严格提高时不会用同分或更差模型覆盖基线。
 
-最终目标：
+推荐参数：
 
-`L = L_CRF + lambda_ground * L_ground`
+- other LR `1e-5`
+- BERT LR `2e-6`
+- ViT LR `1e-6`
+- image dropout `0`
+- patience `3`
+- routed CRF `0.5`
+- consistency KL `0.2`
+- temperature `2`
 
-默认 `tau=0.9`、`T=0.1`、`lambda_ground=0.1`，背景 NONE 总权重为实体监督质量的 0.25。原始 token KL 与全局 image KL 默认权重均为 0，仅保留作消融。门控使用的 gold 只来自训练集，验证与测试不产生教师损失；部署时不调用 LLM。
+旧 `grounding selector loss` 必须设为 0，grounding fusion 和 utility gate 必须关闭；否则实验同时混入已知负结果。代码会拒绝同时启用 routed intervention 与旧 grounding loss。
 
-## 核心贡献表述
+## 开发与测试协议
 
-1. 提出 gold 条件化的反事实视觉效用教师，区分图片描绘相关性与对实体类型的增量消歧价值。
-2. 提出连续效用—NONE 软目标与安全抑制门，在不改变基线初始前向路径的情况下控制视觉噪声。
-3. 教师完全离线，学生推理速度、API 成本和数据隐私边界与原 AGVS 一致。
+所有参数选择必须带 `--skip-test`，只看验证集。单种子完整方案必须同时满足：
 
-论文中应在实验得到支持后再写“提升性能”；在此之前可主张方法解决了 noisy teacher supervision，并通过消融验证机制。
+1. epoch 0 验证 F1 与严格基线相差不超过 0.0005；
+2. 相对 epoch 0 提高至少 0.003；
+3. 相对同学习率、同 epoch 的 continued-training 对照提高至少 0.003。
 
-## 必做实验
+通过后固定设置，使用种子 `42、1234、2026`：平均提升至少 0.003，至少两个种子为正，任一种子下降不超过 0.003。全部配置冻结后才去掉 `--skip-test`，运行正式测试。
 
-| 实验 | token KL | global image KL | gated grounding | 目的 |
-| --- | ---: | ---: | ---: | --- |
-| AGVS | 0 | 0 | 0 | 严格基线 |
-| Raw token KD | 0.5 | 0 | 0 | 复现噪声标签影响 |
-| Global image KD | 0 | 0.2 | 0 | 样本级图像监督 |
-| Proposed | 0 | 0 | 0.1 | 主方法 |
-| Proposed + raw KD | 0.1 | 0 | 0.1 | 使用独立 mner cache，判断 token KD 是否仍有互补性 |
+当前测试集已经在早期开发中被多次查看，因此论文应如实说明开发历史。若需要更严格的无泄漏证据，应增加封存的新划分或外部数据集。
 
-主方法先固定同一 seed、batch size 和学习率，搜索 `lambda_ground={0.02,0.05,0.1,0.2}` 与 `tau={0.5,0.7,0.8}`。选择只能依据验证集 F1，测试集只在配置确定后运行一次。至少报告 3 个随机种子的均值和标准差。
+## 实验矩阵
 
-附加消融：自由 MNER 缓存 vs gold-conditioned grounding、去掉 confidence gate、使用 `--no-llm-grounding-fusion` 让辅助头不进入融合、使用 `--no-llm-grounding-detach-backbone` 恢复共享梯度、将 background ratio 设为 0、去掉 NONE、把实体级 target 换成全局 image score、随机打乱教师 image_ids、固定 slot-0、CLIP 图文相似度教师，以及按实体类型和图片数量分组报告 F1。正式实验还应加入图片顺序置换一致性，并至少人工核查 100–200 个实体的图片证据。
+| 实验 | routed CRF | KL | 教师 route | 目的 |
+| --- | ---: | ---: | --- | --- |
+| Strict AGVS | 0 | 0 | 无 | 基线 |
+| Continued training | 0 | 0 | 无 | 排除额外微调收益 |
+| Route only | 0.5 | 0 | 正确 | 检验去噪视图监督 |
+| Consistency only | 0 | 0.2 | 正确 | 检验特权视图蒸馏 |
+| LGEI | 0.5 | 0.2 | 正确 | 主方法 |
+| Shuffled evidence | 0.5 | 0.2 | 样本内打乱 | 检验证据语义 |
+| Random matched route | 0.5 | 0.2 | 匹配 route 大小 | 排除仅减少图片数量的效果 |
 
-## 已观察到的负结果
+补充分析按实体类型、数据域、图片数量、`NONE/all/subset/single` 证据模式分组。至少人工核查 100--200 个实体的图片证据，并报告缓存覆盖率和过滤原因。
 
-在 UNI、seed 1234、batch size 4 上，第一版直接融合取得测试 F1 0.8286；关闭融合但保留共享 grounding 梯度取得 0.8260，均未超过 0.8318 基线。该结果表明问题不只来自融合残差，grounding 辅助梯度本身也会使共享表示偏离 NER 目标。因此后续主实验必须使用梯度隔离、背景 NONE 门控和零初始化残差，并将旧实现作为负迁移消融完整报告。
+## 论文贡献边界
 
-998条utility先导缓存的第一轮实验取得最佳验证 F1 0.8136、测试 F1 0.8250。安全门控参数在最初更新后落到负区间，实际门控恒为0，说明NER没有采用尚未预热的效用预测。同时，统一的全模型梯度裁剪仍让独立辅助头改变了NER梯度尺度。修正版将NER与辅助头分组裁剪，并在两轮选择头预热之后开放效用门；这两项必须作为实现正确性控制，而不是性能调参。
+实验得到支持后可以主张：
 
-## 训练前审计
+1. 提出 gold 锚定的 MLLM 证据标注，阻止教师改变 NER 边界与类别；
+2. 提出训练期双视图证据干预，把 MLLM 图片选择作为特权信息蒸馏进完整视图学生；
+3. 保持原 AGVS 单次完整视图推理，不增加部署 API 和延迟。
 
-先运行：
-
-```bash
-python scripts/audit_llm_grounding.py \
-  --teacher-task grounding \
-  --input dataset/text/MNER-UNI_train.txt \
-  --cache teacher_cache/qwen_grounding/MNER-UNI_train.jsonl \
-  --image-root dataset/images \
-  --twitter-image-root dataset/twitter2017_images
-```
-
-若某阈值下可用实体过少，优先降低阈值；不要重新打开 raw token KD。审计应记录可用实体数、覆盖样本数、类别分布和过滤原因，作为论文教师质量分析的一部分。
+在三种子结果完成前，只能把性能提升写作研究假设，不能预先声称达到 0.86。
