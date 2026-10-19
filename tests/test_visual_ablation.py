@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 
 from scripts.evaluate_visual_ablation import ImageMaskOverrideDataset
@@ -29,3 +33,22 @@ def test_text_only_ablation_changes_only_the_image_mask() -> None:
     for original_value, ablated_value in zip(original[:-1], ablated[:-1]):
         assert torch.equal(original_value, ablated_value)
     assert ablated[-1].tolist() == [0, 0, 0, 0]
+
+
+def test_visual_ablation_script_runs_directly() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(project_root / "scripts" / "evaluate_visual_ablation.py"),
+            "--help",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--checkpoint" in result.stdout
