@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from seqeval.metrics import f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from models.agvs_mner import AgvsMnerModel
 from modules.crf_topk import select_corpus_micro_f1_oracle, topk_viterbi_decode
@@ -186,7 +187,7 @@ def main() -> None:
     sample_offset = 0
 
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc="CRF top-k audit", unit="batch"):
             (
                 input_ids,
                 token_type_ids,
