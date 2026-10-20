@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk-img-patches", "--topk_img_patches", default=12, type=int)
     parser.add_argument("--image-dropout-prob", "--image_dropout_prob", default=0.2, type=float)
     parser.add_argument("--output-dropout", "--output_dropout", default=0.2, type=float)
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Train and select checkpoints on validation data without reading the test split.",
+    )
     return parser.parse_args()
 
 
@@ -113,11 +118,13 @@ def main() -> None:
 
     train_dataset = MultimodalNerDataset(args, f"MNER-{args.dataset}_train.txt")
     dev_dataset = MultimodalNerDataset(args, f"MNER-{args.dataset}_val.txt")
-    test_dataset = MultimodalNerDataset(args, f"MNER-{args.dataset}_test.txt")
     data_loader_kwargs = {"batch_size": args.batch_size, "num_workers": args.num_workers}
     train_data = DataLoader(train_dataset, shuffle=True, **data_loader_kwargs)
     dev_data = DataLoader(dev_dataset, shuffle=False, **data_loader_kwargs)
-    test_data = DataLoader(test_dataset, shuffle=False, **data_loader_kwargs)
+    test_data = None
+    if not args.skip_test:
+        test_dataset = MultimodalNerDataset(args, f"MNER-{args.dataset}_test.txt")
+        test_data = DataLoader(test_dataset, shuffle=False, **data_loader_kwargs)
 
     label_mapping = train_dataset.processor.get_label_mapping(include_subword_label=True)
     model = AgvsMnerModel(list(label_mapping), args)
