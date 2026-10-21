@@ -71,6 +71,17 @@ def test_evaluator_applies_high_confidence_choice_and_falls_back_safely() -> Non
     assert result["harmful_changes"] == 0
     assert result["fallbacks"]["below_confidence"] == 1
     assert result["top1_exact_preservation"] == 1.0
+    diagnostics = result["accepted_change_diagnostics"]
+    assert diagnostics["overall"]["count"] == 1
+    assert diagnostics["overall"]["beneficial"] == 1
+    assert diagnostics["overall"]["top1_exact_changed"] == 0
+    assert diagnostics["by_baseline_error_type"]["entity_type"][
+        "beneficial_rate"
+    ] == 1.0
+    assert diagnostics["by_selected_crf_rank"]["2"]["count"] == 1
+    assert diagnostics["by_used_image_evidence"]["False"]["count"] == 1
+    assert diagnostics["by_decisive_span"]["False"]["count"] == 1
+    assert diagnostics["by_margin_bucket"]["missing"]["count"] == 1
 
 
 def test_rerank_scripts_support_direct_execution() -> None:

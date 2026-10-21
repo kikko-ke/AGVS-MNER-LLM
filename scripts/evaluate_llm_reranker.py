@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import defaultdict
 import json
 import sys
 from pathlib import Path
@@ -134,6 +135,42 @@ def sample_f1(gold: list[str], prediction: list[str]) -> float:
     return 1.0 if denominator == 0 else 2 * true_positive / denominator
 
 
+def summarize_change_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize accepted changes without exposing individual gold labels."""
+    beneficial = sum(row["outcome"] == "beneficial" for row in rows)
+    harmful = sum(row["outcome"] == "harmful" for row in rows)
+    neutral = sum(row["outcome"] == "neutral" for row in rows)
+    count = len(rows)
+    top1_exact = sum(bool(row["top1_exact"]) for row in rows)
+    return {
+        "count": count,
+        "beneficial": beneficial,
+        "harmful": harmful,
+        "neutral": neutral,
+        "beneficial_rate": beneficial / count if count else 0.0,
+        "harmful_rate": harmful / count if count else 0.0,
+        "mean_sample_f1_delta": (
+            sum(float(row["sample_f1_delta"]) for row in rows) / count
+            if count
+            else 0.0
+        ),
+        "top1_exact_changed": top1_exact,
+    }
+
+
+def group_change_rows(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row[key])].append(row)
+    return {
+        group: summarize_change_rows(grouped[group])
+        for group in sorted(grouped)
+    }
+
+
 def candidate_by_rank(record: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = sorted(record["candidates"], key=lambda item: int(item["crf_rank"]))
     if not candidates or int(candidates[0]["crf_rank"]) != 1:
@@ -186,6 +223,7 @@ def evaluate_threshold(
     neutral_changes = 0
     top1_exact_routed = 0
     top1_exact_preserved = 0
+    change_rows: list[dict[str, Any]] = []
     fallbacks = {
         "not_routed": 0,
         "missing_decision": 0,
@@ -234,10 +272,35 @@ def evaluate_threshold(
                 after = sample_f1(gold_sequence, selected)
                 if after > before:
                     beneficial_changes += 1
+                    outcome = "beneficial"
                 elif after < before:
                     harmful_changes += 1
+                    outcome = "harmful"
                 else:
                     neutral_changes += 1
+                    outcome = "neutral"
+                raw_decision = decisions[int(record["sample_id"])]
+                margin = record.get("route_features", {}).get(
+                    "top1_top2_gap_per_word"
+                )
+                change_rows.append(
+                    {
+                        "outcome": outcome,
+                        "sample_f1_delta": after - before,
+                        "top1_exact": top1_exact,
+                        "baseline_error_type": applied["baseline_error_type"],
+                        "selected_crf_rank": int(
+                            applied["candidate"].get("crf_rank", 0)
+                        ),
+                        "used_image_evidence": bool(
+                            raw_decision.get("used_image_ids", [])
+                        ),
+                        "has_decisive_span": bool(
+                            raw_decision.get("decisive_spans", [])
+                        ),
+                        "margin_bucket": margin_bucket(margin),
+                    }
+                )
 
         if route_selected and top1_exact and (
             extract_bio_entities(selected) == extract_bio_entities(gold_sequence)
@@ -263,7 +326,38 @@ def evaluate_threshold(
         ),
         "top1_exact_routed": top1_exact_routed,
         "fallbacks": fallbacks,
+        "accepted_change_diagnostics": {
+            "overall": summarize_change_rows(change_rows),
+            "by_baseline_error_type": group_change_rows(
+                change_rows, "baseline_error_type"
+            ),
+            "by_selected_crf_rank": group_change_rows(
+                change_rows, "selected_crf_rank"
+            ),
+            "by_used_image_evidence": group_change_rows(
+                change_rows, "used_image_evidence"
+            ),
+            "by_decisive_span": group_change_rows(
+                change_rows, "has_decisive_span"
+            ),
+            "by_margin_bucket": group_change_rows(
+                change_rows, "margin_bucket"
+            ),
+        },
     }
+
+
+def margin_bucket(value: Any) -> str:
+    if value is None:
+        return "missing"
+    margin = float(value)
+    if margin < 0.05:
+        return "[0.00,0.05)"
+    if margin < 0.10:
+        return "[0.05,0.10)"
+    if margin < 0.20:
+        return "[0.10,0.20)"
+    return "[0.20,inf)"
 
 
 def main() -> None:
