@@ -163,7 +163,7 @@ def test_alternative_can_cite_a_removed_baseline_span():
     assert decision.decisive_spans[0].start == 0
     with pytest.raises(ValueError, match="must keep the baseline"):
         validate_rerank_output(
-            {**alternative, "uncertain": True},
+            {**payload, "uncertain": True},
             {"P_A1B2C3D4", "P_E5F6A7B8"},
             set(),
             baseline_candidate_id="P_A1B2C3D4",
