@@ -41,6 +41,19 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Decode this multiple of max(K) before entity-equivalent deduplication.",
     )
+    parser.add_argument(
+        "--target-f1",
+        type=float,
+        default=0.86,
+        help="Target used only for oracle gain-accounting diagnostics.",
+    )
+    parser.add_argument(
+        "--atomic-route-budgets",
+        nargs="+",
+        type=int,
+        default=[50, 100, 200, 400, 800, 1200, 1600],
+        help="Low-margin route budgets audited for the atomic edit groups.",
+    )
     return parser.parse_args()
 
 
@@ -138,12 +151,38 @@ def _metrics(gold: list[list[str]], predictions: list[list[str]]) -> dict[str, f
     }
 
 
+def _target_analysis(
+    top1_f1: float,
+    oracle_f1: float,
+    target_f1: float,
+) -> dict[str, float | bool | None]:
+    gain_needed = max(target_f1 - top1_f1, 0.0)
+    gain_available = max(oracle_f1 - top1_f1, 0.0)
+    return {
+        "target_f1": target_f1,
+        "target_reachable": oracle_f1 + 1e-12 >= target_f1,
+        "gain_needed_over_top1": gain_needed,
+        "full_topk_oracle_gain_available": gain_available,
+        "fraction_of_full_topk_oracle_gain_required": (
+            0.0
+            if gain_needed == 0.0
+            else None
+            if gain_available == 0.0
+            else gain_needed / gain_available
+        ),
+    }
+
+
 def main() -> None:
     cli = parse_args()
     if not cli.ks or min(cli.ks) <= 0:
         raise ValueError("--ks must contain positive integers")
     if cli.oversample_factor <= 0:
         raise ValueError("--oversample-factor must be positive")
+    if not 0.0 <= cli.target_f1 <= 1.0:
+        raise ValueError("--target-f1 must be in [0, 1]")
+    if not cli.atomic_route_budgets or min(cli.atomic_route_budgets) <= 0:
+        raise ValueError("--atomic-route-budgets must contain positive integers")
     requested_ks = sorted(set(cli.ks))
     maximum_k = max(requested_ks)
     decode_k = maximum_k * cli.oversample_factor
@@ -358,6 +397,11 @@ def main() -> None:
             "exact_corpus_micro_f1_oracle": oracle_metrics,
             "oracle_gain_over_constrained_top1": oracle_metrics["f1"]
             - constrained_metrics["f1"],
+            "target_analysis": _target_analysis(
+                constrained_metrics["f1"],
+                oracle_metrics["f1"],
+                cli.target_f1,
+            ),
             "oracle_rank_histogram": {
                 str(rank): count for rank, count in sorted(rank_histogram.items())
             },
@@ -380,6 +424,9 @@ def main() -> None:
                     for candidates in retained_candidate_sequences
                 ],
                 retained_candidate_scores,
+                normalization_lengths=[len(gold) for gold in gold_sequences],
+                target_f1=cli.target_f1,
+                atomic_route_budgets=cli.atomic_route_budgets,
             ),
         }
 

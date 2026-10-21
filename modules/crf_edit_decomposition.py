@@ -22,6 +22,8 @@ EDIT_CLASSES = (DELETION, ADDITION, TYPE_CHANGE, BOUNDARY_CHANGE, MIXED)
 EDIT_GROUPS = {
     "deletion_or_entity_type": (DELETION, TYPE_CHANGE),
 }
+ATOMIC_DELETION_OR_TYPE = "single_deletion_or_single_entity_type"
+ATOMIC_ALL_PURE = "single_pure_entity_edit"
 
 
 def _normalize_entities(entities: Iterable[tuple[Any, Any, Any]]) -> EntitySet:
@@ -110,6 +112,43 @@ def classify_entity_edit(
     return MIXED
 
 
+def is_atomic_entity_edit(
+    top1_entities: Iterable[tuple[Any, Any, Any]],
+    alternative_entities: Iterable[tuple[Any, Any, Any]],
+    edit_class: str | None = None,
+) -> bool:
+    """Return whether an alternative makes exactly one supported entity edit.
+
+    Supported operations are one complete-entity deletion, one addition, one
+    same-span type replacement, or one overlapping same-type boundary
+    replacement.  This deliberately excludes candidates that happen to share
+    a coarse edit class but modify several entities at once.
+    """
+    top1 = _normalize_entities(top1_entities)
+    alternative = _normalize_entities(alternative_entities)
+    label = edit_class or classify_entity_edit(top1, alternative)
+    removed = top1 - alternative
+    added = alternative - top1
+    if label == DELETION:
+        return len(removed) == 1 and not added
+    if label == ADDITION:
+        return len(added) == 1 and not removed
+    if label == TYPE_CHANGE:
+        return (
+            len(removed) == 1
+            and len(added) == 1
+            and next(iter(removed))[:2] == next(iter(added))[:2]
+        )
+    if label == BOUNDARY_CHANGE:
+        return (
+            len(removed) == 1
+            and len(added) == 1
+            and next(iter(removed))[2] == next(iter(added))[2]
+            and _overlaps(next(iter(removed)), next(iter(added)))
+        )
+    return False
+
+
 def _entity_counts(gold: EntitySet, prediction: EntitySet) -> EntityCounts:
     return (
         len(gold & prediction),
@@ -140,21 +179,57 @@ def _sample_f1(counts: EntityCounts) -> float:
     return 1.0 if denominator == 0 else 2 * true_positive / denominator
 
 
+def _target_analysis(
+    top1_f1: float,
+    oracle_f1: float,
+    target_f1: float,
+) -> dict[str, Any]:
+    gain_needed = max(target_f1 - top1_f1, 0.0)
+    available_gain = max(oracle_f1 - top1_f1, 0.0)
+    return {
+        "target_f1": target_f1,
+        "target_reachable": oracle_f1 + 1e-12 >= target_f1,
+        "gain_needed_over_top1": gain_needed,
+        "oracle_gain_available": available_gain,
+        "fraction_of_oracle_gain_required": (
+            0.0
+            if gain_needed == 0.0
+            else None
+            if available_gain == 0.0
+            else gain_needed / available_gain
+        ),
+    }
+
+
 def decompose_topk_edit_oracles(
     gold_entities: Sequence[Iterable[tuple[Any, Any, Any]]],
     candidate_entities: Sequence[Sequence[Iterable[tuple[Any, Any, Any]]]],
     candidate_scores: Sequence[Sequence[float]],
+    *,
+    normalization_lengths: Sequence[int] | None = None,
+    target_f1: float = 0.86,
+    atomic_route_budgets: Sequence[int] = (50, 100, 200, 400, 800, 1200, 1600),
 ) -> dict[str, Any]:
     """Compute exact corpus micro-F1 under restricted top-1 edit sets."""
     if not (
         len(gold_entities) == len(candidate_entities) == len(candidate_scores)
     ):
         raise ValueError("Gold, candidate, and score rows must have equal length")
+    if not 0.0 <= target_f1 <= 1.0:
+        raise ValueError("target_f1 must be in [0, 1]")
+    if normalization_lengths is not None:
+        if len(normalization_lengths) != len(gold_entities):
+            raise ValueError("normalization_lengths must match the number of rows")
+        if any(int(length) <= 0 for length in normalization_lengths):
+            raise ValueError("normalization_lengths must contain positive integers")
+    if any(int(budget) <= 0 for budget in atomic_route_budgets):
+        raise ValueError("atomic_route_budgets must contain positive integers")
 
     normalized_gold = [_normalize_entities(row) for row in gold_entities]
     normalized_candidates: list[list[EntitySet]] = []
     normalized_scores: list[list[float]] = []
     edit_labels: list[list[str]] = []
+    atomic_edits: list[list[bool]] = []
     unchanged_alternatives = 0
     for candidates, scores in zip(candidate_entities, candidate_scores):
         if not candidates:
@@ -164,13 +239,16 @@ def decompose_topk_edit_oracles(
         candidate_row = [_normalize_entities(candidate) for candidate in candidates]
         score_row = [float(score) for score in scores]
         labels = [UNCHANGED]
+        atomic = [False]
         for candidate in candidate_row[1:]:
             label = classify_entity_edit(candidate_row[0], candidate)
             labels.append(label)
+            atomic.append(is_atomic_entity_edit(candidate_row[0], candidate, label))
             unchanged_alternatives += int(label == UNCHANGED)
         normalized_candidates.append(candidate_row)
         normalized_scores.append(score_row)
         edit_labels.append(labels)
+        atomic_edits.append(atomic)
 
     top1_counts = [
         _entity_counts(gold, candidates[0])
@@ -182,12 +260,13 @@ def decompose_topk_edit_oracles(
         for gold, candidates in zip(normalized_gold, normalized_candidates)
     )
 
-    audit_specs = {
-        **{edit_class: (edit_class,) for edit_class in EDIT_CLASSES},
-        **EDIT_GROUPS,
-    }
-    audit_results: dict[str, Any] = {}
-    for audit_name, allowed_edit_classes in audit_specs.items():
+    def compute_audit(
+        allowed_edit_classes: Sequence[str],
+        *,
+        require_atomic: bool = False,
+        maximum_rank: int | None = None,
+        allowed_samples: set[int] | None = None,
+    ) -> dict[str, Any]:
         allowed_counts: list[list[EntityCounts]] = []
         allowed_scores: list[list[float]] = []
         original_indices: list[list[int]] = []
@@ -197,12 +276,22 @@ def decompose_topk_edit_oracles(
         locally_improvable_errors = 0
         exactly_recoverable_errors = 0
 
-        for gold, candidates, scores, labels, baseline_counts in zip(
-            normalized_gold,
-            normalized_candidates,
-            normalized_scores,
-            edit_labels,
-            top1_counts,
+        for sample_index, (
+            gold,
+            candidates,
+            scores,
+            labels,
+            atomic,
+            baseline_counts,
+        ) in enumerate(
+            zip(
+                normalized_gold,
+                normalized_candidates,
+                normalized_scores,
+                edit_labels,
+                atomic_edits,
+                top1_counts,
+            )
         ):
             indices = [
                 0,
@@ -210,6 +299,9 @@ def decompose_topk_edit_oracles(
                     index
                     for index, label in enumerate(labels[1:], start=1)
                     if label in allowed_edit_classes
+                    and (not require_atomic or atomic[index])
+                    and (maximum_rank is None or index + 1 <= maximum_rank)
+                    and (allowed_samples is None or sample_index in allowed_samples)
                 ],
             ]
             alternatives = indices[1:]
@@ -254,8 +346,9 @@ def decompose_topk_edit_oracles(
         if abs(oracle_metrics["f1"] - oracle_f1) > 1e-12:
             raise RuntimeError("Edit oracle totals disagree with the exact optimizer")
         rank_histogram = Counter(index + 1 for index in selected_original)
-        audit_results[audit_name] = {
+        result = {
             "allowed_edit_classes": list(allowed_edit_classes),
+            "atomic_single_edit_required": require_atomic,
             "alternative_candidates": alternative_candidates,
             "samples_with_alternative": samples_with_alternative,
             "top1_error_samples_with_alternative": error_samples_with_alternative,
@@ -272,7 +365,85 @@ def decompose_topk_edit_oracles(
             },
             "exact_corpus_micro_f1_oracle": oracle_metrics,
             "oracle_gain_over_top1": oracle_metrics["f1"] - top1_metrics["f1"],
+            "target_analysis": _target_analysis(
+                top1_metrics["f1"], oracle_metrics["f1"], target_f1
+            ),
         }
+        return result
+
+    audit_specs = {
+        **{edit_class: (edit_class,) for edit_class in EDIT_CLASSES},
+        **EDIT_GROUPS,
+    }
+    audit_results = {
+        audit_name: compute_audit(allowed_edit_classes)
+        for audit_name, allowed_edit_classes in audit_specs.items()
+    }
+
+    maximum_available_rank = max(len(row) for row in normalized_candidates)
+
+    def compute_atomic_group(atomic_classes: Sequence[str]) -> dict[str, Any]:
+        atomic_result = compute_audit(atomic_classes, require_atomic=True)
+        atomic_result["cumulative_rank_ceiling_oracles"] = {
+            str(rank): compute_audit(
+                atomic_classes,
+                require_atomic=True,
+                maximum_rank=rank,
+            )
+            for rank in range(2, maximum_available_rank + 1)
+        }
+
+        if normalization_lengths is not None:
+            atomic_eligible_samples = {
+                sample_index
+                for sample_index, (labels, atomic) in enumerate(
+                    zip(edit_labels, atomic_edits)
+                )
+                if any(
+                    label in atomic_classes and atomic[index]
+                    for index, label in enumerate(labels[1:], start=1)
+                )
+            }
+            routed_by_margin: list[tuple[float, int]] = []
+            for sample_index in atomic_eligible_samples:
+                scores = normalized_scores[sample_index]
+                if len(scores) < 2:
+                    continue
+                margin = max(scores[0] - scores[1], 0.0) / int(
+                    normalization_lengths[sample_index]
+                )
+                routed_by_margin.append((margin, sample_index))
+            routed_by_margin.sort(key=lambda item: (item[0], item[1]))
+
+            route_oracles: dict[str, Any] = {}
+            for requested_budget in sorted(
+                {int(value) for value in atomic_route_budgets}
+            ):
+                routed = routed_by_margin[:requested_budget]
+                allowed_samples = {sample_index for _, sample_index in routed}
+                section = compute_audit(
+                    atomic_classes,
+                    require_atomic=True,
+                    allowed_samples=allowed_samples,
+                )
+                section["requested_route_budget"] = requested_budget
+                section["routed_samples"] = len(routed)
+                section["maximum_normalized_top1_top2_margin"] = (
+                    routed[-1][0] if routed else None
+                )
+                route_oracles[str(requested_budget)] = section
+            atomic_result["low_margin_route_audit"] = {
+                "routing_basis": (
+                    "lowest normalized top1-top2 CRF margin among samples that "
+                    "contain an alternative in this atomic edit group"
+                ),
+                "eligible_samples": len(routed_by_margin),
+                "budgets": route_oracles,
+            }
+        return atomic_result
+
+    atomic_deletion_or_type = (DELETION, TYPE_CHANGE)
+    atomic_all_pure = (DELETION, ADDITION, TYPE_CHANGE, BOUNDARY_CHANGE)
 
     return {
         "classification_basis": (
@@ -286,5 +457,20 @@ def decompose_topk_edit_oracles(
         },
         "groups": {
             group_name: audit_results[group_name] for group_name in EDIT_GROUPS
+        },
+        "atomic_classes": {
+            edit_class: compute_audit((edit_class,), require_atomic=True)
+            for edit_class in (
+                DELETION,
+                ADDITION,
+                TYPE_CHANGE,
+                BOUNDARY_CHANGE,
+            )
+        },
+        "atomic_groups": {
+            ATOMIC_DELETION_OR_TYPE: compute_atomic_group(
+                atomic_deletion_or_type
+            ),
+            ATOMIC_ALL_PURE: compute_atomic_group(atomic_all_pure),
         },
     }

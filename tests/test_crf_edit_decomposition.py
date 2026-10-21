@@ -4,6 +4,8 @@ import pytest
 
 from modules.crf_edit_decomposition import (
     ADDITION,
+    ATOMIC_ALL_PURE,
+    ATOMIC_DELETION_OR_TYPE,
     BOUNDARY_CHANGE,
     DELETION,
     EDIT_GROUPS,
@@ -12,6 +14,7 @@ from modules.crf_edit_decomposition import (
     UNCHANGED,
     classify_entity_edit,
     decompose_topk_edit_oracles,
+    is_atomic_entity_edit,
 )
 
 
@@ -49,6 +52,30 @@ def test_pure_boundary_matching_handles_multiple_same_type_entities() -> None:
     top1 = {(0, 2, "PER"), (4, 6, "PER")}
     alternative = {(0, 1, "PER"), (3, 6, "PER")}
     assert classify_entity_edit(top1, alternative) == BOUNDARY_CHANGE
+
+
+def test_atomic_entity_edits_reject_multi_entity_changes() -> None:
+    top1 = {(0, 1, "PER"), (3, 4, "ORG")}
+
+    assert is_atomic_entity_edit(top1, {(0, 1, "PER")})
+    assert not is_atomic_entity_edit(top1, set())
+    assert is_atomic_entity_edit(top1, {*top1, (6, 7, "MIS")})
+    assert is_atomic_entity_edit(
+        top1,
+        {(0, 1, "LOC"), (3, 4, "ORG")},
+    )
+    assert not is_atomic_entity_edit(
+        top1,
+        {(0, 1, "LOC"), (3, 4, "MIS")},
+    )
+    assert is_atomic_entity_edit(
+        top1,
+        {(0, 2, "PER"), (3, 4, "ORG")},
+    )
+    assert not is_atomic_entity_edit(
+        top1,
+        {(0, 2, "PER"), (3, 5, "ORG")},
+    )
 
 
 def test_edit_oracles_allow_only_one_class_plus_top1() -> None:
@@ -108,6 +135,12 @@ def test_edit_oracles_allow_only_one_class_plus_top1() -> None:
     assert safe_group["oracle_gain_over_top1"] > result["classes"][DELETION][
         "oracle_gain_over_top1"
     ]
+    atomic_groups = result["atomic_groups"]
+    assert atomic_groups[ATOMIC_DELETION_OR_TYPE]["alternative_candidates"] == 2
+    assert atomic_groups[ATOMIC_ALL_PURE]["alternative_candidates"] == 4
+    assert atomic_groups[ATOMIC_ALL_PURE]["exactly_recoverable_top1_errors"] == 4
+    assert result["atomic_classes"][ADDITION]["alternative_candidates"] == 1
+    assert result["atomic_classes"][BOUNDARY_CHANGE]["alternative_candidates"] == 1
 
 
 def test_decomposition_uses_exact_corpus_micro_f1_not_sentence_average() -> None:
@@ -132,3 +165,63 @@ def test_decomposition_uses_exact_corpus_micro_f1_not_sentence_average() -> None
     deletion = result["classes"][DELETION]
     assert deletion["oracle_selected_alternatives"] == 1
     assert deletion["exact_corpus_micro_f1_oracle"]["f1"] == pytest.approx(200 / 201)
+
+
+def test_atomic_oracle_reports_rank_margin_and_target_headroom() -> None:
+    gold = [
+        {(0, 1, "PER")},
+        {(0, 1, "LOC"), (2, 3, "ORG")},
+        {(0, 1, "MIS")},
+    ]
+    candidates = [
+        [
+            {(0, 1, "ORG")},
+            {(0, 1, "LOC")},
+            {(0, 1, "PER")},
+        ],
+        [
+            {(0, 1, "LOC"), (2, 3, "ORG"), (4, 5, "PER")},
+            {(0, 1, "LOC"), (2, 3, "ORG")},
+            {(0, 1, "LOC")},
+        ],
+        [
+            {(0, 1, "PER"), (2, 3, "ORG")},
+            set(),  # multi-deletion must not enter the atomic oracle
+        ],
+    ]
+    scores = [
+        [10.0, 9.5, 9.0],
+        [8.0, 7.8, 7.0],
+        [6.0, 5.9],
+    ]
+
+    result = decompose_topk_edit_oracles(
+        gold,
+        candidates,
+        scores,
+        normalization_lengths=[2, 2, 2],
+        target_f1=0.65,
+        atomic_route_budgets=[1, 2],
+    )
+    atomic = result["atomic_groups"][ATOMIC_DELETION_OR_TYPE]
+    all_pure = result["atomic_groups"][ATOMIC_ALL_PURE]
+
+    assert atomic["atomic_single_edit_required"] is True
+    assert atomic["alternative_candidates"] == 3
+    assert atomic["exactly_recoverable_top1_errors"] == 2
+    assert atomic["cumulative_rank_ceiling_oracles"]["2"][
+        "exactly_recoverable_top1_errors"
+    ] == 1
+    assert atomic["cumulative_rank_ceiling_oracles"]["3"][
+        "exactly_recoverable_top1_errors"
+    ] == 2
+    assert atomic["target_analysis"]["target_reachable"] is True
+    assert all_pure["alternative_candidates"] == atomic["alternative_candidates"]
+
+    route = atomic["low_margin_route_audit"]
+    assert route["eligible_samples"] == 2
+    assert route["budgets"]["1"]["routed_samples"] == 1
+    assert route["budgets"]["1"][
+        "maximum_normalized_top1_top2_margin"
+    ] == pytest.approx(0.1)
+    assert route["budgets"]["2"]["routed_samples"] == 2
