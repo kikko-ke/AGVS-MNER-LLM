@@ -42,6 +42,28 @@ def test_inference_projection_hash_is_independent_of_gold_labels(tmp_path: Path)
     assert sha256_inference_projection(data) == first_hash
 
 
+def test_inference_projection_hash_accepts_escaped_surrogates(tmp_path: Path) -> None:
+    data = tmp_path / "sample.txt"
+    # Some MNER records store emoji as escaped UTF-16 surrogate pairs.  After
+    # literal_eval these remain surrogate code units, which cannot be encoded
+    # directly as UTF-8 but must still produce a stable inference-only hash.
+    data.write_text(
+        "{'text': ['before', '\\ud83d\\ude02', 'after'], "
+        "'images': ['a.jpg'], 'label': ['O', 'O', 'O']}\n",
+        encoding="utf-8",
+    )
+
+    first_hash = sha256_inference_projection(data)
+    assert len(first_hash) == 64
+
+    data.write_text(
+        "{'text': ['before', '\\ud83d\\ude02', 'after'], "
+        "'images': ['a.jpg'], 'label': ['B-PER', 'I-PER', 'O']}\n",
+        encoding="utf-8",
+    )
+    assert sha256_inference_projection(data) == first_hash
+
+
 def test_inference_structure_matches_partial_wordpiece_truncation() -> None:
     dataset = MultimodalInferenceDataset.__new__(MultimodalInferenceDataset)
     dataset.max_sequence_length = 5  # CLS + three pieces + SEP

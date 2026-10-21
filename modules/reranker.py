@@ -89,7 +89,13 @@ def _stable_json_bytes(value: Any) -> bytes:
     try:
         serialized = json.dumps(
             value,
-            ensure_ascii=False,
+            # Dataset records can contain escaped UTF-16 surrogate code units
+            # (for example ``\\ud83d\\ude02``).  Python preserves those code
+            # units after ``ast.literal_eval``, but they cannot be encoded as
+            # standalone UTF-8 characters.  ASCII JSON escaping gives every
+            # such value a deterministic byte representation without changing
+            # the semantic fields included in the hash.
+            ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
