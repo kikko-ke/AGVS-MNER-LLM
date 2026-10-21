@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from models.agvs_mner import AgvsMnerModel
+from modules.crf_edit_decomposition import decompose_topk_edit_oracles
 from modules.crf_topk import select_corpus_micro_f1_oracle, topk_viterbi_decode
 from modules.dataset import MultimodalNerDataset
 from modules.llm_dataset import extract_bio_entities
@@ -372,6 +373,14 @@ def main() -> None:
             "mean_candidates": sum(retained_counts) / max(len(retained_counts), 1),
             "mean_top1_top2_score_gap_per_word": sum(normalized_score_gaps)
             / max(len(normalized_score_gaps), 1),
+            "edit_decomposition": decompose_topk_edit_oracles(
+                [extract_bio_entities(gold) for gold in gold_sequences],
+                [
+                    [extract_bio_entities(candidate) for candidate in candidates]
+                    for candidates in retained_candidate_sequences
+                ],
+                retained_candidate_scores,
+            ),
         }
 
     print("=== CRF top-k oracle summary ===")

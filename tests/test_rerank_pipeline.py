@@ -6,7 +6,13 @@ from pathlib import Path
 
 from llm.prompts import RERANK_PROMPT_VERSION
 from modules.reranker import candidate_record_fingerprint, opaque_candidate_ids
-from scripts.evaluate_llm_reranker import evaluate_threshold, metrics, routed_oracle
+from scripts.evaluate_llm_reranker import (
+    evaluate_threshold,
+    explore_policy_grid,
+    metrics,
+    routed_oracle,
+    wilson_interval,
+)
 
 
 def _record(sample_id: int, top1: str, alternative: str) -> dict:
@@ -82,6 +88,97 @@ def test_evaluator_applies_high_confidence_choice_and_falls_back_safely() -> Non
     assert diagnostics["by_used_image_evidence"]["False"]["count"] == 1
     assert diagnostics["by_decisive_span"]["False"]["count"] == 1
     assert diagnostics["by_margin_bucket"]["missing"]["count"] == 1
+
+
+def test_exploratory_grid_reports_intersections_without_freezing_policy() -> None:
+    records = []
+    gold = []
+    decisions = {}
+    for sample_id in range(8):
+        beneficial = sample_id < 6
+        top1 = "B-ORG" if beneficial else "B-LOC"
+        alternative = "O" if beneficial else "B-ORG"
+        record = _record(sample_id, top1, alternative)
+        record["route_features"] = {"top1_top2_gap_per_word": 0.02}
+        record["candidate_fingerprint"] = candidate_record_fingerprint(record)
+        records.append(record)
+        gold.append(["O"] if beneficial else ["B-LOC"])
+        decisions[sample_id] = {
+            "sample_id": sample_id,
+            "candidate_fingerprint": record["candidate_fingerprint"],
+            "prompt_version": RERANK_PROMPT_VERSION,
+            "selected_candidate_id": record["candidates"][1]["candidate_id"],
+            "confidence": 0.99,
+            "uncertain": False,
+            "baseline_error_type": (
+                "spurious_entity" if beneficial else "missing_entity"
+            ),
+            "used_image_ids": ["IMG_1"] if sample_id % 2 == 0 else [],
+        }
+
+    baseline_predictions = [record["candidates"][0]["bio"] for record in records]
+    baseline = metrics(gold, baseline_predictions)
+    oracle, _ = routed_oracle(gold, records)
+    result = explore_policy_grid(
+        0.95,
+        gold,
+        records,
+        decisions,
+        baseline,
+        oracle,
+        min_accepted_changes=5,
+        max_hypotheses=10,
+    )
+
+    assert result["status"] == "exploratory_only_not_a_frozen_policy"
+    assert result["grid_hypotheses_evaluated"] == 7 * 4 * 6 * 3
+    assert result["v2_pilot_changes_available"] == 8
+    assert "disjoint V3" in result["required_next_step"]
+    assert any(
+        "error=spurious_entity" in key and "rank=2" in key
+        for key in result["atomic_intersections"]
+    )
+    assert result["top_v3_hypotheses"]
+    assert any(
+        item["hypothesis"]["baseline_error_type"] == "spurious_entity"
+        and item["changes"]["beneficial"] == 6
+        and item["changes"]["harmful"] == 0
+        and item["top1_exact_preservation"] == 1.0
+        for item in result["top_v3_hypotheses"]
+    )
+
+
+def test_wilson_interval_handles_empty_and_small_samples() -> None:
+    assert wilson_interval(0, 0) == [0.0, 1.0]
+    lower, upper = wilson_interval(8, 9)
+    assert 0.5 < lower < 8 / 9 < upper < 1.0
+
+
+def test_exploratory_grid_cannot_freeze_a_policy() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(project_root / "scripts" / "evaluate_llm_reranker.py"),
+            "--input",
+            "unused-input",
+            "--candidates",
+            "unused-candidates",
+            "--decisions",
+            "unused-decisions",
+            "--explore-policy-grid",
+            "--freeze-policy",
+            "forbidden-policy",
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "cannot load/freeze a policy" in result.stderr
 
 
 def test_rerank_scripts_support_direct_execution() -> None:
