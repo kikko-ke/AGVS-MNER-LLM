@@ -227,5 +227,5 @@ Decision rules:
 3. A non-baseline selection must use uncertain=false. If uncertain, select the baseline.
 4. Confidence is confidence that the selected candidate is better than every other fixed
    choice. Reserve 0.95 for direct, unambiguous evidence; do not use it by default.
-Use only available image slot IDs. decisive_spans must be entity spans from the selected
-candidate; they may be empty for removal of a spurious baseline entity."""
+Use only available image slot IDs. decisive_spans may cite entity spans from the baseline
+or selected candidate, including a baseline span that the selected candidate removes."""

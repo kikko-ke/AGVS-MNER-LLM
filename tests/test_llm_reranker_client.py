@@ -139,6 +139,28 @@ def test_response_enforces_conservative_baseline_contract():
             set(),
             baseline_candidate_id="P_A1B2C3D4",
         )
+
+
+def test_alternative_can_cite_a_removed_baseline_span():
+    payload = valid_response("P_E5F6A7B8")
+    payload["decisive_spans"] = [
+        {"start": 0, "end": 1, "evidence": "the baseline mention is spurious"}
+    ]
+
+    decision = validate_rerank_output(
+        payload,
+        {"P_A1B2C3D4", "P_E5F6A7B8"},
+        set(),
+        token_count=2,
+        candidate_spans={
+            "P_A1B2C3D4": {(0, 1)},
+            "P_E5F6A7B8": set(),
+        },
+        baseline_candidate_id="P_A1B2C3D4",
+    )
+
+    assert decision.selected_candidate_id == "P_E5F6A7B8"
+    assert decision.decisive_spans[0].start == 0
     with pytest.raises(ValueError, match="must keep the baseline"):
         validate_rerank_output(
             {**alternative, "uncertain": True},

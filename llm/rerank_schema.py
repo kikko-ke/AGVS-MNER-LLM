@@ -202,7 +202,11 @@ def validate_rerank_output(
         raise ValueError("decisive_spans must be a list")
     allowed_spans = None
     if candidate_spans is not None:
+        # A residual verifier may cite either the replacement span or the
+        # baseline span that it removes/corrects.  Both are fixed candidate
+        # content; arbitrary locations remain forbidden.
         allowed_spans = set(candidate_spans.get(selected_id, ()))
+        allowed_spans.update(candidate_spans.get(baseline_candidate_id, ()))
     decisive_spans: list[DecisiveSpan] = []
     for raw_span in raw_spans:
         if not isinstance(raw_span, Mapping):
@@ -214,7 +218,9 @@ def validate_rerank_output(
         ):
             raise ValueError(f"invalid decisive span [{start}, {end})")
         if allowed_spans is not None and (start, end) not in allowed_spans:
-            raise ValueError("decisive span is not in the selected candidate")
+            raise ValueError(
+                "decisive span is not in the baseline or selected candidate"
+            )
         decisive_spans.append(
             DecisiveSpan(start, end, str(raw_span.get("evidence", "")).strip())
         )
