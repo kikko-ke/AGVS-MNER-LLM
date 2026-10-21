@@ -4,7 +4,9 @@
 
 严格基线验证 F1 为 `0.8179`。CRF 候选审计得到 oracle@3 `0.8803`、oracle@5 `0.8977`、oracle@10 `0.9128`；top-1 的 483 个实体集合错误样本中，top-5 可完整恢复 172 个。K=5 在候选复杂度和理论余量之间最合适：达到 `0.86` 需要实现约 `53%` 的完整 top-5 oracle 增益。
 
-主方法采用 MLLM 受约束重排。AGVS 的 emissions 与 CRF 转移矩阵生成五个合法 BIO 序列，Qwen3-VL 查看文本、实际可解码图片以及五个候选实体集合，并且只能返回其中一个不透明候选 ID。候选展示顺序由 sample ID 与 prompt 版本确定性打乱；CRF rank 和 score 不进入提示词。缺失/非法响应、越界候选、决策 hash 不匹配、`uncertain=true` 或置信度低于冻结阈值时回退 top-1；候选 artifact 自身不一致时 fail closed 并中止。
+第一版盲重排 pilot 没有通过：200 条样本的最佳整体增益只有 `+0.00125` F1，归一化 oracle 增益 `6.3%`；随机对照组明显负增益。低 margin 组从 `0.5783` 提升到 `0.6190`，说明无标签 CRF margin 可以定位可干预样本，但直接五选一会破坏过多正确 top-1。
+
+第二版采用 MLLM 基线锚定残差验证。AGVS 生成五个合法 BIO 序列，提示明确公开哪个不透明 ID 是 CRF top-1 基线，但不公开 CRF 分数和替代候选 rank。Qwen3-VL 默认保留基线；选择替代项时必须声明一个具体的 boundary/entity_type/missing_entity/spurious_entity 错误。缺失/非法响应、越界候选、决策 hash 不匹配、`uncertain=true` 或置信度不足时均回退 top-1。
 
 为阻止标签泄漏，流水线物理拆分为三个程序：
 
@@ -12,7 +14,7 @@
 2. `build_llm_rerank_cache.py` 只读取候选 artifact 和图片，调用 Qwen3-VL；它不导入 gold evaluator。
 3. `evaluate_llm_reranker.py` 才读取 `label`，计算整体 micro F1、路由子集 oracle、实际获得的 oracle 增益比例和 top-1 保持率。
 
-先固定做 200 次验证集 pilot：100 条按无标签 top1-top2 margin 最低选择，另 100 条只由固定 seed 和 sample ID 从剩余候选中抽作随机控制。两组只是分层抽样，不是最终部署路由器。go/no-go 条件是实现这 200 条样本 oracle 增益至少 `60%`，且保持至少 `95%` 原本完全正确的 top-1。通过后把 prompt、LLM 型号、候选生成配置与置信度阈值写入 policy manifest，再补齐全验证集。正式方法对所有样本请求 MLLM，低置信/不确定决策回退 top-1。最终测试强制读取验证阶段 policy、全量 scope 和唯一阈值。
+第二版先固定做 100 次验证集 pilot，只选择无标签 top1-top2 margin 最低的样本，不再请求已经证实有害的随机对照组。go/no-go 条件是实现这 100 条样本 oracle 增益至少 `60%`，且保持至少 `95%` 原本完全正确的 top-1。在通过前不补齐验证集，也不访问测试集；通过后再用验证集冻结 margin 路由规则、prompt、LLM 型号和置信度阈值。
 
 ## 历史训练期方案与问题诊断
 

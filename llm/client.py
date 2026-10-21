@@ -345,6 +345,7 @@ class LLMTeacherClient:
         candidates: Iterable[Mapping[str, Any]],
         *,
         valid_image_ids: Iterable[int] | None = None,
+        baseline_candidate_id: str,
         prompt_version: str = RERANK_PROMPT_VERSION,
     ) -> RerankDecision:
         """Select one immutable candidate and reject every out-of-contract answer."""
@@ -352,6 +353,11 @@ class LLMTeacherClient:
             raise ValueError("prompt_version contains unsupported characters")
         words = [str(word) for word in words]
         typed_candidates = validate_rerank_candidates(candidates, words)
+        typed_candidate_ids = {
+            candidate.candidate_id for candidate in typed_candidates
+        }
+        if baseline_candidate_id not in typed_candidate_ids:
+            raise ValueError("baseline_candidate_id is not in the supplied candidates")
         image_paths, prepared_images = self._prepare_images(image_paths)
         decodable_ids = {
             index for index, data_url in enumerate(prepared_images) if data_url is not None
@@ -376,7 +382,12 @@ class LLMTeacherClient:
         )
         if not manifest:
             manifest = "[no decodable images]"
-        user_text = build_rerank_user_prompt(words, typed_candidates, manifest)
+        user_text = build_rerank_user_prompt(
+            words,
+            typed_candidates,
+            manifest,
+            baseline_candidate_id,
+        )
         candidate_spans = {
             candidate.candidate_id: [
                 (entity.start, entity.end) for entity in candidate.entities
@@ -392,6 +403,7 @@ class LLMTeacherClient:
                 decodable_ids,
                 token_count=len(words),
                 candidate_spans=candidate_spans,
+                baseline_candidate_id=baseline_candidate_id,
             )
 
         result = self._complete_prepared_json(

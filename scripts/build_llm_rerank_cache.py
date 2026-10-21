@@ -152,6 +152,7 @@ def load_existing(
                 set(map(int, candidate.get("valid_image_ids", []))),
                 token_count=len(candidate.get("words", [])),
                 candidate_spans=candidate_spans,
+                baseline_candidate_id=str(candidate.get("top1_candidate_id", "")),
             )
             selected_candidate = next(
                 item
@@ -284,6 +285,7 @@ def main() -> None:
                     paths,
                     prompt_candidates,
                     valid_image_ids=valid_image_ids,
+                    baseline_candidate_id=str(record["top1_candidate_id"]),
                     prompt_version=RERANK_PROMPT_VERSION,
                 )
                 request_latency = time.perf_counter() - request_started
@@ -306,6 +308,7 @@ def main() -> None:
                     "selected_crf_rank": int(selected_candidate["crf_rank"]),
                     "confidence": decision.confidence,
                     "uncertain": decision.uncertain,
+                    "baseline_error_type": decision.baseline_error_type,
                     "used_image_ids": list(decision.used_image_ids),
                     "decisive_spans": [
                         {

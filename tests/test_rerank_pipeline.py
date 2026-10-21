@@ -31,6 +31,7 @@ def _record(sample_id: int, top1: str, alternative: str) -> dict:
             },
         ],
     }
+    record["top1_candidate_id"] = identifiers[0]
     record["candidate_fingerprint"] = candidate_record_fingerprint(record)
     return record
 
@@ -50,6 +51,7 @@ def test_evaluator_applies_high_confidence_choice_and_falls_back_safely() -> Non
             "selected_candidate_id": first["candidates"][1]["candidate_id"],
             "confidence": 0.95,
             "uncertain": False,
+            "baseline_error_type": "entity_type",
         },
         1: {
             "sample_id": 1,
@@ -58,6 +60,7 @@ def test_evaluator_applies_high_confidence_choice_and_falls_back_safely() -> Non
             "selected_candidate_id": second["candidates"][1]["candidate_id"],
             "confidence": 0.70,
             "uncertain": False,
+            "baseline_error_type": "entity_type",
         },
     }
 

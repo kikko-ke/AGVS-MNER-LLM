@@ -54,6 +54,9 @@ def valid_response(candidate_id="P_A1B2C3D4"):
         "selected_candidate_id": candidate_id,
         "confidence": 0.9,
         "uncertain": False,
+        "baseline_error_type": (
+            "none" if candidate_id == "P_A1B2C3D4" else "spurious_entity"
+        ),
         "used_image_ids": [],
         "decisive_spans": [
             {"start": 0, "end": 1, "evidence": "name context"}
@@ -64,12 +67,19 @@ def valid_response(candidate_id="P_A1B2C3D4"):
 
 def test_prompt_drops_crf_rank_scores_and_recomputes_surface():
     typed = validate_rerank_candidates(candidates(), ["Alice", "arrived"])
-    prompt = build_rerank_user_prompt(["Alice", "arrived"], typed, "[none]")
+    prompt = build_rerank_user_prompt(
+        ["Alice", "arrived"],
+        typed,
+        "[none]",
+        "P_A1B2C3D4",
+    )
     assert '"crf_score"' not in prompt
     assert '"rank"' not in prompt
     assert "123.0" not in prompt
     assert '"surface": "Alice"' in prompt
     assert "wrong" not in prompt
+    assert "Baseline candidate" in prompt
+    assert '"candidate_id": "P_A1B2C3D4"' in prompt
 
 
 @pytest.mark.parametrize("confidence", [float("nan"), float("inf"), -0.1, 1.1])
@@ -83,18 +93,29 @@ def test_response_rejects_non_finite_or_out_of_range_confidence(confidence):
             set(),
             token_count=2,
             candidate_spans={"P_A1B2C3D4": {(0, 1)}},
+            baseline_candidate_id="P_A1B2C3D4",
         )
 
 
 def test_response_rejects_unknown_candidate_image_and_span():
     payload = valid_response("P_UNKNOWN")
     with pytest.raises(ValueError, match="supplied candidates"):
-        validate_rerank_output(payload, {"P_A1B2C3D4"}, set())
+        validate_rerank_output(
+            payload,
+            {"P_A1B2C3D4"},
+            set(),
+            baseline_candidate_id="P_A1B2C3D4",
+        )
 
     payload = valid_response()
     payload["used_image_ids"] = [2]
     with pytest.raises(ValueError, match="was not supplied"):
-        validate_rerank_output(payload, {"P_A1B2C3D4"}, {0})
+        validate_rerank_output(
+            payload,
+            {"P_A1B2C3D4"},
+            {0},
+            baseline_candidate_id="P_A1B2C3D4",
+        )
 
     payload = valid_response()
     payload["decisive_spans"] = [{"start": 1, "end": 2}]
@@ -105,6 +126,25 @@ def test_response_rejects_unknown_candidate_image_and_span():
             set(),
             token_count=2,
             candidate_spans={"P_A1B2C3D4": {(0, 1)}},
+            baseline_candidate_id="P_A1B2C3D4",
+        )
+
+
+def test_response_enforces_conservative_baseline_contract():
+    alternative = valid_response("P_E5F6A7B8")
+    with pytest.raises(ValueError, match="concrete baseline error"):
+        validate_rerank_output(
+            {**alternative, "baseline_error_type": "none"},
+            {"P_A1B2C3D4", "P_E5F6A7B8"},
+            set(),
+            baseline_candidate_id="P_A1B2C3D4",
+        )
+    with pytest.raises(ValueError, match="must keep the baseline"):
+        validate_rerank_output(
+            {**alternative, "uncertain": True},
+            {"P_A1B2C3D4", "P_E5F6A7B8"},
+            set(),
+            baseline_candidate_id="P_A1B2C3D4",
         )
 
 
@@ -136,7 +176,10 @@ def test_rerank_client_retries_disconnect_and_schema_failure(monkeypatch):
         retry_base_delay=0,
     )
     decision = client.complete_rerank_json(
-        ["Alice", "arrived"], [], candidates()
+        ["Alice", "arrived"],
+        [],
+        candidates(),
+        baseline_candidate_id="P_A1B2C3D4",
     )
     assert decision.selected_candidate_id == "P_A1B2C3D4"
     assert decision.reason.startswith("The sentence")

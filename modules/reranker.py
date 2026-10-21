@@ -481,6 +481,8 @@ def select_pilot_routes(
 def validate_reranker_decision(
     decision: Mapping[str, Any],
     candidate_ids: Sequence[str],
+    *,
+    baseline_candidate_id: str,
 ) -> dict[str, Any]:
     """Validate and normalize the decision fields that may affect prediction."""
     if not isinstance(decision, Mapping):
@@ -488,6 +490,8 @@ def validate_reranker_decision(
     selected = decision.get("selected_candidate_id")
     if not isinstance(selected, str) or selected not in candidate_ids:
         raise ValueError("selected_candidate_id is not one of the supplied candidates")
+    if baseline_candidate_id not in candidate_ids:
+        raise ValueError("baseline_candidate_id is not one of the supplied candidates")
     confidence = decision.get("confidence")
     if isinstance(confidence, bool):
         raise ValueError("confidence must be a number")
@@ -500,10 +504,29 @@ def validate_reranker_decision(
     uncertain = decision.get("uncertain")
     if not isinstance(uncertain, bool):
         raise ValueError("uncertain must be a boolean")
+    baseline_error_type = decision.get("baseline_error_type")
+    allowed_error_types = {
+        "none",
+        "boundary",
+        "entity_type",
+        "missing_entity",
+        "spurious_entity",
+    }
+    if baseline_error_type not in allowed_error_types:
+        raise ValueError("baseline_error_type is invalid")
+    if selected == baseline_candidate_id:
+        if baseline_error_type != "none":
+            raise ValueError("baseline selection requires baseline_error_type=none")
+    else:
+        if baseline_error_type == "none":
+            raise ValueError("alternative selection requires a concrete baseline error")
+        if uncertain:
+            raise ValueError("an uncertain decision must keep the baseline candidate")
     return {
         "selected_candidate_id": selected,
         "confidence": confidence,
         "uncertain": uncertain,
+        "baseline_error_type": baseline_error_type,
     }
 
 
@@ -528,6 +551,7 @@ def apply_reranker_decision(
         len(candidates),
         prompt_version,
     )
+    baseline_candidate_id = record.get("top1_candidate_id")
     selected_index = 0
     accepted = False
     fallback_reason: str | None = None
@@ -543,7 +567,11 @@ def apply_reranker_decision(
         fallback_reason = "prompt_version_mismatch"
     else:
         try:
-            normalized = validate_reranker_decision(decision, identifiers)
+            normalized = validate_reranker_decision(
+                decision,
+                identifiers,
+                baseline_candidate_id=str(baseline_candidate_id),
+            )
         except ValueError:
             fallback_reason = "invalid_decision"
         else:
@@ -564,4 +592,7 @@ def apply_reranker_decision(
         "fallback_reason": fallback_reason,
         "confidence": None if normalized is None else normalized["confidence"],
         "uncertain": None if normalized is None else normalized["uncertain"],
+        "baseline_error_type": (
+            None if normalized is None else normalized["baseline_error_type"]
+        ),
     }

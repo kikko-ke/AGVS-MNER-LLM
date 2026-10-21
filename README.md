@@ -6,11 +6,13 @@
 
 已完成的验证集图片消融为：完整图片 `0.8179`、关闭图片 `0.8152`、按相同图片掩码打乱图片 `0.8170`。正确图文对应相对随机图片只增加约 `0.00087` F1，因此当前 AGVS checkpoint 的主要视觉增益来自通用视觉偏置，而不是图片语义。继续调 grounding fusion、utility gate 或 LGEI 不再作为性能主线，也不需要继续生成教师缓存。
 
-CRF top-k 上限审计已经通过。严格基线验证 F1 为 `0.8179`，oracle@3 为 `0.8803`、oracle@5 为 `0.8977`、oracle@10 为 `0.9128`。这说明正确序列经常已经存在于前五个候选中，当前主要问题是排序。下一阶段采用 **MLLM 受约束 CRF 重排**：Qwen3-VL 只能从五个完整 BIO 候选中选择一个，不能生成或修改实体。
+CRF top-k 上限审计已经通过。严格基线验证 F1 为 `0.8179`，oracle@3 为 `0.8803`、oracle@5 为 `0.8977`、oracle@10 为 `0.9128`。这说明正确序列经常已经存在于前五个候选中，当前主要问题是排序。第一版“隐藏全部 CRF 先验、让 Qwen3-VL 直接五选一”的 200 条 pilot 未通过：整体只实现 `6.3%` 的可用 oracle 增益；随机对照组 F1 从 `0.8516` 降到 `0.8148`。低 margin 组有正增益（`0.5783 -> 0.6190`），但破坏正确 top-1 的比例过高。
 
-整个流程分为三个互相隔离的阶段：候选导出不读取 `label`，LLM 请求只读取候选、文本与图片，最后的评估脚本才读取 gold。候选以不透明 ID 和确定性随机顺序展示，提示词不会暴露 CRF 排名或分数。缺失/非法响应、低置信度、`uncertain=true` 或决策 provenance 不匹配时回退到 CRF top-1；候选 artifact 自身的 hash/provenance 损坏时直接中止，避免继续评估不可追溯的数据。
+第二版改为 **MLLM 基线锚定残差验证**：只对最低 CRF margin 样本请求 Qwen3-VL，明确标出 CRF top-1 为默认基线；只有模型指出具体的边界、类型、漏检或误检错误时才能选择一个固定替代候选。候选仍不可修改，CRF 分数和其余候选 rank 仍不进入提示词。
 
-先在验证集导出全部 top-5 候选。默认从 100 个最低 CRF margin 样本和 100 个固定随机控制样本组成 200 次请求的 pilot：
+整个流程分为三个互相隔离的阶段：候选导出不读取 `label`，LLM 请求只读取候选、文本与图片，最后的评估脚本才读取 gold。候选使用不透明 ID；提示只公开哪个 ID 是基线，不公开数值分数或替代候选的 rank。缺失/非法响应、低置信度、`uncertain=true`、没有具体基线错误类型或决策 provenance 不匹配时回退到 CRF top-1；候选 artifact 自身的 hash/provenance 损坏时直接中止。
+
+先在验证集导出全部 top-5 候选，只对 100 个最低 CRF margin 样本执行第二版 pilot：
 
 ```bash
 cd /root/autodl-tmp/AGVS-MNER-LLM
@@ -26,7 +28,7 @@ test -n "$LLM_MODEL"    || { echo "缺少 LLM_MODEL"; exit 1; }
 BASELINE=/path/to/strict_baseline/best_model.pt
 test -f "$BASELINE" || { echo "找不到基线 checkpoint"; exit 1; }
 
-mkdir -p rerank_cache/qwen3vl32b_top5 logs
+mkdir -p rerank_cache/qwen3vl32b_anchor_v2 logs
 
 python -u scripts/export_crf_rerank_candidates.py \
   --checkpoint "$BASELINE" \
@@ -34,17 +36,17 @@ python -u scripts/export_crf_rerank_candidates.py \
   --k 5 \
   --oversample-factor 20 \
   --uncertainty-queries 100 \
-  --random-control-queries 100 \
+  --random-control-queries 0 \
   --route-seed 20261020 \
-  --output rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --output rerank_cache/qwen3vl32b_anchor_v2/val_candidates.jsonl \
   --device cuda \
   --batch-size 4 \
   --num-workers 4 \
   2>&1 | tee logs/export_rerank_val.log
 
 python -u scripts/build_llm_rerank_cache.py \
-  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
-  --output rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --candidates rerank_cache/qwen3vl32b_anchor_v2/val_candidates.jsonl \
+  --output rerank_cache/qwen3vl32b_anchor_v2/val_decisions.jsonl \
   --image-root dataset/images \
   --twitter-image-root dataset/twitter2017_images \
   --base-url "$LLM_BASE_URL" \
@@ -56,14 +58,14 @@ python -u scripts/build_llm_rerank_cache.py \
 
 python -u scripts/evaluate_llm_reranker.py \
   --input dataset/text/MNER-UNI_val.txt \
-  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
-  --decisions rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --candidates rerank_cache/qwen3vl32b_anchor_v2/val_candidates.jsonl \
+  --decisions rerank_cache/qwen3vl32b_anchor_v2/val_decisions.jsonl \
   --confidence-thresholds 0.80 0.85 0.90 0.95 \
-  --output rerank_cache/qwen3vl32b_top5/pilot_metrics.json \
-  2>&1 | tee logs/evaluate_rerank_pilot.log
+  --output rerank_cache/qwen3vl32b_anchor_v2/pilot_metrics.json \
+  2>&1 | tee logs/evaluate_rerank_anchor_v2_pilot.log
 ```
 
-pilot 的 go/no-go 门槛为：实现这 200 条路由样本 oracle 增益的至少 `60%`，并保留至少 `95%` 原本 top-1 完全正确的样本。100 条低 margin 与 100 条随机样本只是分层 pilot 抽样；正式方法对全部样本调用受约束重排，再由冻结的置信度策略决定采用候选还是回退 top-1。
+第二版 pilot 的 go/no-go 门槛仍为：实现这 100 条低 margin 样本 oracle 增益的至少 `60%`，并保留至少 `95%` 原本 top-1 完全正确的样本。在达到门槛之前不要补齐验证集、冻结 policy 或访问测试集。后续正式路由规则必须只由验证集确定，并在测试前冻结。
 
 选择一个已经通过门槛的阈值（下面以 `0.90` 为例），重新执行评估并写出不可变 policy：
 

@@ -136,13 +136,16 @@ Return one entity object for every supplied gold entity, preserving its order.
 If no gold entities are supplied, return an empty entities list."""
 
 
-RERANK_PROMPT_VERSION = "crf-topk-rerank-v1"
+RERANK_PROMPT_VERSION = "crf-topk-anchor-verify-v2"
 
-RERANK_SYSTEM_PROMPT = """You are a constrained multimodal named-entity reranker.
-Choose exactly one of the supplied candidate IDs. The candidate set is immutable: do
-not add, remove, merge, split, move, or relabel an entity. Candidate IDs are opaque and
-their display order carries no quality signal. Use the sentence as the primary evidence.
-Use an image only when its visible content resolves a real ambiguity between candidates.
+RERANK_SYSTEM_PROMPT = """You are a conservative multimodal named-entity verifier.
+The supplied baseline candidate is the prediction of a trained CRF and is the default.
+Keep it unless one supplied alternative fixes a concrete, localizable boundary, entity
+type, missing-entity, or spurious-entity error. General plausibility is not enough to
+override the baseline. The candidate set is immutable: do not add, remove, merge, split,
+move, or relabel an entity outside the supplied choices. Candidate IDs are opaque and
+alternative display order carries no quality signal. Use the sentence as primary evidence.
+Use an image only when visible content directly resolves the candidate disagreement.
 The entity types are PER (people or named characters), ORG (organizations, companies,
 teams, or groups), LOC (named geographic places), and MIS (other named entities such as
 products, works, events, or awards). Judge the complete entity set, including boundaries.
@@ -154,8 +157,12 @@ def build_rerank_user_prompt(
     words: Sequence[str],
     candidates: Sequence[RerankCandidate],
     image_manifest: str,
+    baseline_candidate_id: str,
 ) -> str:
-    """Render only candidate content; CRF ranks and scores never enter the prompt."""
+    """Render a baseline-anchored comparison without exposing CRF ranks or scores."""
+    candidate_ids = {candidate.candidate_id for candidate in candidates}
+    if baseline_candidate_id not in candidate_ids:
+        raise ValueError("baseline_candidate_id is not in the supplied candidates")
     indexed_words = "\n".join(
         f"{index}: {json.dumps(str(word), ensure_ascii=False)}"
         for index, word in enumerate(words)
@@ -175,13 +182,26 @@ def build_rerank_user_prompt(
         }
         for candidate in candidates
     ]
-    return f"""Select the best fixed MNER candidate for this example.
+    baseline = next(
+        candidate
+        for candidate in safe_candidates
+        if candidate["candidate_id"] == baseline_candidate_id
+    )
+    alternatives = [
+        candidate
+        for candidate in safe_candidates
+        if candidate["candidate_id"] != baseline_candidate_id
+    ]
+    return f"""Verify the baseline MNER prediction against fixed alternatives.
 
 Sentence tokens with positions:
 {indexed_words}
 
-Candidates (choose one candidate_id exactly as written):
-{json.dumps(safe_candidates, ensure_ascii=False, indent=2)}
+Baseline candidate (keep this unless a specific error is directly supported):
+{json.dumps(baseline, ensure_ascii=False, indent=2)}
+
+Alternative candidates (their order carries no quality signal):
+{json.dumps(alternatives, ensure_ascii=False, indent=2)}
 
 Available image slots:
 {image_manifest}
@@ -191,6 +211,7 @@ Return exactly this JSON shape:
   "selected_candidate_id": "C_0123456789",
   "confidence": 0.87,
   "uncertain": false,
+  "baseline_error_type": "none",
   "used_image_ids": [0],
   "decisive_spans": [
     {{"start": 3, "end": 4, "evidence": "short discriminating cue"}}
@@ -198,5 +219,13 @@ Return exactly this JSON shape:
   "brief_reason": "one short reason for choosing this supplied candidate"
 }}
 
-Choose a candidate even when uncertain; then set uncertain to true. Use only available
-image slot IDs. decisive_spans must be entity spans from the selected candidate."""
+Decision rules:
+1. Select the baseline and use baseline_error_type="none" when it is acceptable or the
+   evidence is ambiguous.
+2. Select an alternative only for a concrete correction and set baseline_error_type to
+   one of "boundary", "entity_type", "missing_entity", or "spurious_entity".
+3. A non-baseline selection must use uncertain=false. If uncertain, select the baseline.
+4. Confidence is confidence that the selected candidate is better than every other fixed
+   choice. Reserve 0.95 for direct, unambiguous evidence; do not use it by default.
+Use only available image slot IDs. decisive_spans must be entity spans from the selected
+candidate; they may be empty for removal of a spurious baseline entity."""

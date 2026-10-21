@@ -11,6 +11,13 @@ from llm.schema import ENTITY_TYPES
 
 
 _CANDIDATE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,63}$")
+BASELINE_ERROR_TYPES = {
+    "none",
+    "boundary",
+    "entity_type",
+    "missing_entity",
+    "spurious_entity",
+}
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,7 @@ class RerankDecision:
     selected_candidate_id: str
     confidence: float
     uncertain: bool
+    baseline_error_type: str
     used_image_ids: tuple[int, ...]
     decisive_spans: tuple[DecisiveSpan, ...]
     brief_reason: str
@@ -54,6 +62,7 @@ class RerankDecision:
             "selected_candidate_id": self.selected_candidate_id,
             "confidence": self.confidence,
             "uncertain": self.uncertain,
+            "baseline_error_type": self.baseline_error_type,
             "used_image_ids": list(self.used_image_ids),
             "decisive_spans": [
                 {
@@ -137,6 +146,7 @@ def validate_rerank_output(
     *,
     token_count: int | None = None,
     candidate_spans: Mapping[str, Iterable[tuple[int, int]]] | None = None,
+    baseline_candidate_id: str | None = None,
 ) -> RerankDecision:
     """Validate a model response without repairing an out-of-contract choice."""
     if not isinstance(payload, Mapping):
@@ -145,6 +155,8 @@ def validate_rerank_output(
     selected_id = payload.get("selected_candidate_id")
     if not isinstance(selected_id, str) or selected_id not in allowed_ids:
         raise ValueError("selected_candidate_id is not one of the supplied candidates")
+    if baseline_candidate_id is None or baseline_candidate_id not in allowed_ids:
+        raise ValueError("baseline_candidate_id is not one of the supplied candidates")
 
     raw_confidence = payload.get("confidence")
     if isinstance(raw_confidence, bool):
@@ -159,6 +171,18 @@ def validate_rerank_output(
     uncertain = payload.get("uncertain")
     if not isinstance(uncertain, bool):
         raise ValueError("uncertain must be a boolean")
+
+    baseline_error_type = payload.get("baseline_error_type")
+    if baseline_error_type not in BASELINE_ERROR_TYPES:
+        raise ValueError("baseline_error_type is invalid")
+    if selected_id == baseline_candidate_id:
+        if baseline_error_type != "none":
+            raise ValueError("baseline selection requires baseline_error_type=none")
+    else:
+        if baseline_error_type == "none":
+            raise ValueError("alternative selection requires a concrete baseline error")
+        if uncertain:
+            raise ValueError("an uncertain decision must keep the baseline candidate")
 
     raw_image_ids = payload.get("used_image_ids", [])
     if not isinstance(raw_image_ids, list):
@@ -206,6 +230,7 @@ def validate_rerank_output(
         selected_candidate_id=selected_id,
         confidence=confidence,
         uncertain=uncertain,
+        baseline_error_type=baseline_error_type,
         used_image_ids=tuple(image_ids),
         decisive_spans=tuple(decisive_spans),
         brief_reason=reason,

@@ -253,18 +253,25 @@ def test_pilot_routes_skip_records_without_distinct_alternatives() -> None:
 def test_validate_and_apply_reranker_decisions_with_safe_fallbacks() -> None:
     record = _record(7)
     identifiers = opaque_candidate_ids(7, 3, "rerank-v1")
+    record["top1_candidate_id"] = identifiers[0]
     valid = {
         "selected_candidate_id": identifiers[1],
         "confidence": 0.91,
         "uncertain": False,
+        "baseline_error_type": "entity_type",
         "candidate_fingerprint": candidate_record_fingerprint(record),
         "prompt_version": "rerank-v1",
     }
 
-    assert validate_reranker_decision(valid, identifiers) == {
+    assert validate_reranker_decision(
+        valid,
+        identifiers,
+        baseline_candidate_id=identifiers[0],
+    ) == {
         "selected_candidate_id": identifiers[1],
         "confidence": 0.91,
         "uncertain": False,
+        "baseline_error_type": "entity_type",
     }
     applied = apply_reranker_decision(
         record,
@@ -279,7 +286,7 @@ def test_validate_and_apply_reranker_decisions_with_safe_fallbacks() -> None:
 
     for decision, reason in (
         ({**valid, "confidence": 0.84}, "below_confidence"),
-        ({**valid, "uncertain": True}, "uncertain"),
+        ({**valid, "uncertain": True}, "invalid_decision"),
         ({**valid, "selected_candidate_id": "C_UNKNOWN"}, "invalid_decision"),
         ({**valid, "candidate_fingerprint": "stale"}, "candidate_fingerprint_mismatch"),
         ({**valid, "prompt_version": "rerank-v0"}, "prompt_version_mismatch"),
@@ -325,6 +332,8 @@ def test_decision_validation_rejects_boolean_confidence() -> None:
                 "selected_candidate_id": identifiers[0],
                 "confidence": True,
                 "uncertain": False,
+                "baseline_error_type": "none",
             },
             identifiers,
+            baseline_candidate_id=identifiers[0],
         )
