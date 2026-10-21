@@ -1,6 +1,22 @@
-# 研究计划：LGEI（LLM-Guided Evidence Intervention）
+# 研究计划：MLLM 受约束 CRF 候选重排
 
-## 问题诊断
+## 当前主方法
+
+严格基线验证 F1 为 `0.8179`。CRF 候选审计得到 oracle@3 `0.8803`、oracle@5 `0.8977`、oracle@10 `0.9128`；top-1 的 483 个实体集合错误样本中，top-5 可完整恢复 172 个。K=5 在候选复杂度和理论余量之间最合适：达到 `0.86` 需要实现约 `53%` 的完整 top-5 oracle 增益。
+
+主方法采用 MLLM 受约束重排。AGVS 的 emissions 与 CRF 转移矩阵生成五个合法 BIO 序列，Qwen3-VL 查看文本、实际可解码图片以及五个候选实体集合，并且只能返回其中一个不透明候选 ID。候选展示顺序由 sample ID 与 prompt 版本确定性打乱；CRF rank 和 score 不进入提示词。缺失/非法响应、越界候选、决策 hash 不匹配、`uncertain=true` 或置信度低于冻结阈值时回退 top-1；候选 artifact 自身不一致时 fail closed 并中止。
+
+为阻止标签泄漏，流水线物理拆分为三个程序：
+
+1. `export_crf_rerank_candidates.py` 使用 inference-only dataset，只访问 `text` 和 `images`，导出候选、checkpoint hash 与只覆盖有序 `text+images` 投影的输入 hash；改变 gold 标签不会改变该 hash 或 pilot 抽样。
+2. `build_llm_rerank_cache.py` 只读取候选 artifact 和图片，调用 Qwen3-VL；它不导入 gold evaluator。
+3. `evaluate_llm_reranker.py` 才读取 `label`，计算整体 micro F1、路由子集 oracle、实际获得的 oracle 增益比例和 top-1 保持率。
+
+先固定做 200 次验证集 pilot：100 条按无标签 top1-top2 margin 最低选择，另 100 条只由固定 seed 和 sample ID 从剩余候选中抽作随机控制。两组只是分层抽样，不是最终部署路由器。go/no-go 条件是实现这 200 条样本 oracle 增益至少 `60%`，且保持至少 `95%` 原本完全正确的 top-1。通过后把 prompt、LLM 型号、候选生成配置与置信度阈值写入 policy manifest，再补齐全验证集。正式方法对所有样本请求 MLLM，低置信/不确定决策回退 top-1。最终测试强制读取验证阶段 policy、全量 scope 和唯一阈值。
+
+## 历史训练期方案与问题诊断
+
+### 问题诊断
 
 严格修复 WordPiece 对齐和评估口径后，同配置无教师 AGVS 在 UNI 上取得约 0.8184 验证 F1 和 0.8324 测试 F1。此前记录的 0.8257 验证 F1 / 0.8318 测试 F1 属于 `token KD=0.5, image KD=0.2` 的 Full KD 实验，并非严格基线。已有三类 LLM 方案没有形成稳定增益：
 
@@ -10,7 +26,7 @@
 
 现有完整 grounding 缓存覆盖 10,227/10,229 个训练样本和几乎全部 gold 实体，且包含具体图片编号。LGEI 直接利用这份覆盖完整的训练期特权信息，不再训练弱测试时路由器。
 
-## 方法
+### 历史方法：LGEI
 
 教师实体为 `e=(start,end,type,confidence,image_ids)`。可靠性门只接受满足以下条件的实体：
 
@@ -32,7 +48,7 @@
 
 该实现是样本级 evidence intervention：多实体样本共享教师证据图片的并集。论文不得将它表述为严格逐实体前向路由。
 
-## 安全微调
+### 安全微调
 
 主实验从严格基线 `best_model.pt` 开始，以较低学习率微调 3--5 个 epoch。训练器在任何更新前先评估 epoch 0 并保存 checkpoint；后续验证 F1 没有严格提高时不会用同分或更差模型覆盖基线。
 
@@ -49,7 +65,7 @@
 
 旧 `grounding selector loss` 必须设为 0，grounding fusion 和 utility gate 必须关闭；否则实验同时混入已知负结果。代码会拒绝同时启用 routed intervention 与旧 grounding loss。
 
-## 开发与测试协议
+### 开发与测试协议
 
 所有参数选择必须带 `--skip-test`，只看验证集。单种子完整方案必须同时满足：
 
@@ -61,7 +77,7 @@
 
 当前测试集已经在早期开发中被多次查看，因此论文应如实说明开发历史。若需要更严格的无泄漏证据，应增加封存的新划分或外部数据集。
 
-## 实验矩阵
+### 实验矩阵
 
 | 实验 | routed CRF | KL | 教师 route | 目的 |
 | --- | ---: | ---: | --- | --- |
@@ -79,8 +95,8 @@
 
 实验得到支持后可以主张：
 
-1. 提出 gold 锚定的 MLLM 证据标注，阻止教师改变 NER 边界与类别；
-2. 提出训练期双视图证据干预，把 MLLM 图片选择作为特权信息蒸馏进完整视图学生；
-3. 保持原 AGVS 单次完整视图推理，不增加部署 API 和延迟。
+1. 提出结构受约束的 MLLM 重排，把开放式生成限制为 CRF 合法候选选择，避免 LLM 改写边界和类型；
+2. 提出全样本候选重排与冻结置信度回退策略，在保持强 top-1 的同时只接受可审计的 LLM 决策；
+3. 提供候选上限、视觉消融和失败回退的完整审计，区分“候选缺失”与“排序错误”。
 
-在三种子结果完成前，只能把性能提升写作研究假设，不能预先声称达到 0.86。
+该方法在推理时需要 MLLM API；缓存记录每次成功请求的延迟、尝试次数与服务端返回的 token usage（若接口提供），论文必须报告调用覆盖、延迟、费用、非法响应率及无 LLM top-1 回退结果。pilot 和完整验证集通过前，只能把性能提升写作研究假设，不能预先声称达到 0.86。

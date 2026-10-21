@@ -3,26 +3,40 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import random
+import re
+import socket
 import time
 import urllib.error
 import urllib.request
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 from PIL import Image, UnidentifiedImageError
 
 from llm.prompts import (
     GROUNDING_SYSTEM_PROMPT,
     GROUNDING_USER_TEMPLATE,
+    RERANK_PROMPT_VERSION,
+    RERANK_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     UTILITY_SYSTEM_PROMPT,
     UTILITY_USER_TEMPLATE,
     USER_TEMPLATE,
+    build_rerank_user_prompt,
 )
+from llm.rerank_schema import (
+    RerankDecision,
+    validate_rerank_candidates,
+    validate_rerank_output,
+)
+
+
+_ValidatedJson = TypeVar("_ValidatedJson")
 
 
 class LLMTeacherClient:
@@ -43,6 +57,8 @@ class LLMTeacherClient:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.last_attempt_count = 0
+        self.last_response_usage: dict[str, Any] | None = None
         if max_retries < 0 or retry_base_delay < 0:
             raise ValueError("max_retries and retry_base_delay must be non-negative")
         if not self.base_url or not self.model:
@@ -82,6 +98,196 @@ class LLMTeacherClient:
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/jpeg;base64,{encoded}"
 
+    def _prepare_images(
+        self, image_paths: Iterable[Path | None]
+    ) -> tuple[list[Path | None], list[str | None]]:
+        paths = list(image_paths)
+        prepared: list[str | None] = []
+        for path in paths:
+            if path is None or not path.exists():
+                prepared.append(None)
+                continue
+            try:
+                prepared.append(self.image_data_url(path))
+            except (OSError, ValueError):
+                prepared.append(None)
+        return paths, prepared
+
+    @staticmethod
+    def _user_content(
+        user_text: str, prepared_images: Sequence[str | None]
+    ) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+        for image_id, data_url in enumerate(prepared_images):
+            if data_url is None:
+                continue
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"The next image is image slot {image_id}.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url, "detail": "low"},
+                    },
+                ]
+            )
+        return content
+
+    @staticmethod
+    def _parse_json_response(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise ValueError("teacher response envelope must be a JSON object")
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ValueError("teacher response is missing message content") from error
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "") for item in content if isinstance(item, dict)
+            )
+        if not isinstance(content, str):
+            raise ValueError("teacher message content must be text")
+        content = content.strip()
+        if content.startswith("```"):
+            lines = content.splitlines()
+            if lines and lines[0].strip().lower() in {"```", "```json"}:
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
+        start, end = content.find("{"), content.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("teacher response did not contain a JSON object")
+        parsed = json.loads(content[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("teacher response must contain a JSON object")
+        return parsed
+
+    def _retry_delay(self, attempt: int, retry_after: float | None = None) -> float:
+        delay = min(self.retry_base_delay * (2**attempt), 60.0)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return delay + random.uniform(0.0, min(1.0, delay * 0.1))
+
+    def _complete_prepared_json(
+        self,
+        system_prompt: str,
+        user_text: str,
+        prepared_images: Sequence[str | None],
+        *,
+        validator: Callable[[dict[str, Any]], _ValidatedJson] | None = None,
+    ) -> dict[str, Any] | _ValidatedJson:
+        request_body = {
+            "model": self.model,
+            "temperature": 0.0,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": self._user_content(user_text, prepared_images),
+                },
+            ],
+        }
+        request_data = json.dumps(request_body).encode("utf-8")
+        retryable_statuses = {429, 500, 502, 503, 504}
+        self.last_attempt_count = 0
+        self.last_response_usage = None
+        for attempt in range(self.max_retries + 1):
+            request = urllib.request.Request(
+                self.endpoint,
+                data=request_data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    envelope = json.loads(response.read().decode("utf-8"))
+                parsed = self._parse_json_response(envelope)
+                validated = validator(parsed) if validator is not None else parsed
+                self.last_attempt_count = attempt + 1
+                usage = envelope.get("usage") if isinstance(envelope, Mapping) else None
+                self.last_response_usage = dict(usage) if isinstance(usage, Mapping) else None
+                return validated
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                headers = error.headers
+                trace_id = (
+                    headers.get("x-siliconcloud-trace-id", "") if headers else ""
+                )
+                trace_text = f", trace_id={trace_id}" if trace_id else ""
+                message = f"teacher request failed ({error.code}{trace_text}): {detail}"
+                if error.code not in retryable_statuses or attempt >= self.max_retries:
+                    raise RuntimeError(message) from error
+                retry_after = None
+                if headers:
+                    try:
+                        retry_after = float(headers.get("Retry-After", ""))
+                    except (TypeError, ValueError):
+                        pass
+                delay = self._retry_delay(attempt, retry_after)
+                print(
+                    f"[retry] HTTP {error.code}; retry "
+                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s"
+                    f"{trace_text}",
+                    flush=True,
+                )
+                time.sleep(delay)
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                socket.timeout,
+                ConnectionError,
+                http.client.HTTPException,
+                OSError,
+            ) as error:
+                if attempt >= self.max_retries:
+                    raise RuntimeError(
+                        f"teacher request transport failure: {error}"
+                    ) from error
+                delay = self._retry_delay(attempt)
+                print(
+                    f"[retry] transport error; retry "
+                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s: {error}",
+                    flush=True,
+                )
+                time.sleep(delay)
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
+                if attempt >= self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt)
+                print(
+                    f"[retry] malformed response; retry "
+                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s: {error}",
+                    flush=True,
+                )
+                time.sleep(delay)
+        raise AssertionError("retry loop ended unexpectedly")
+
+    def complete_multimodal_json(
+        self,
+        system_prompt: str,
+        user_text: str,
+        image_paths: Iterable[Path | None] = (),
+        *,
+        validator: Callable[[dict[str, Any]], _ValidatedJson] | None = None,
+    ) -> dict[str, Any] | _ValidatedJson:
+        """Make a JSON-only multimodal call, retrying transport and malformed output."""
+        _, prepared_images = self._prepare_images(image_paths)
+        return self._complete_prepared_json(
+            system_prompt,
+            user_text,
+            prepared_images,
+            validator=validator,
+        )
+
     def complete_json(
         self,
         words: Iterable[str],
@@ -90,16 +296,7 @@ class LLMTeacherClient:
         teacher_task: str = "grounding",
     ) -> dict[str, Any]:
         indexed_words = "\n".join(f"{index}: {word}" for index, word in enumerate(words))
-        image_paths = list(image_paths)
-        prepared_images: list[str | None] = []
-        for path in image_paths:
-            if path is None or not path.exists():
-                prepared_images.append(None)
-                continue
-            try:
-                prepared_images.append(self.image_data_url(path))
-            except (OSError, ValueError):
-                prepared_images.append(None)
+        image_paths, prepared_images = self._prepare_images(image_paths)
 
         manifest = "\n".join(
             f"{index}: {path.name if path and prepared_images[index] else '[missing image]'}"
@@ -133,111 +330,76 @@ class LLMTeacherClient:
                 image_manifest=manifest,
             )
 
-        user_content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": user_text,
-            }
-        ]
-        for image_id, data_url in enumerate(prepared_images):
-            if data_url is not None:
-                user_content.append(
-                    {
-                        "type": "text",
-                        "text": f"The next image is image slot {image_id}.",
-                    }
-                )
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": data_url,
-                            "detail": "low",
-                        },
-                    }
-                )
-
-        request_body = {
-            "model": self.model,
-            "temperature": 0.0,
-            "max_tokens": self.max_tokens,
-            "stream": False,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-        }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(request_body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
+        result = self._complete_prepared_json(
+            system_prompt,
+            user_text,
+            prepared_images,
         )
-        retryable_statuses = {429, 500, 502, 503, 504}
-        for attempt in range(self.max_retries + 1):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as error:
-                detail = error.read().decode("utf-8", errors="replace")
-                headers = error.headers
-                trace_id = (
-                    headers.get("x-siliconcloud-trace-id", "") if headers else ""
-                )
-                trace_text = f", trace_id={trace_id}" if trace_id else ""
-                message = f"teacher request failed ({error.code}{trace_text}): {detail}"
-                if error.code not in retryable_statuses or attempt >= self.max_retries:
-                    raise RuntimeError(message) from error
+        assert isinstance(result, dict)
+        return result
 
-                retry_after = None
-                if headers:
-                    try:
-                        retry_after = float(headers.get("Retry-After", ""))
-                    except (TypeError, ValueError):
-                        retry_after = None
-                delay = min(self.retry_base_delay * (2 ** attempt), 60.0)
-                if retry_after is not None:
-                    delay = max(delay, retry_after)
-                delay += random.uniform(0.0, min(1.0, delay * 0.1))
-                print(
-                    f"[retry] HTTP {error.code}; retry "
-                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s"
-                    f"{trace_text}",
-                    flush=True,
-                )
-                time.sleep(delay)
-            except (urllib.error.URLError, TimeoutError) as error:
-                if attempt >= self.max_retries:
-                    raise RuntimeError(
-                        f"teacher request transport failure: {error}"
-                    ) from error
-                delay = min(self.retry_base_delay * (2 ** attempt), 60.0)
-                delay += random.uniform(0.0, min(1.0, delay * 0.1))
-                print(
-                    f"[retry] transport error; retry "
-                    f"{attempt + 1}/{self.max_retries} in {delay:.1f}s: {error}",
-                    flush=True,
-                )
-                time.sleep(delay)
+    def complete_rerank_json(
+        self,
+        words: Sequence[str],
+        image_paths: Iterable[Path | None],
+        candidates: Iterable[Mapping[str, Any]],
+        *,
+        valid_image_ids: Iterable[int] | None = None,
+        prompt_version: str = RERANK_PROMPT_VERSION,
+    ) -> RerankDecision:
+        """Select one immutable candidate and reject every out-of-contract answer."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", prompt_version):
+            raise ValueError("prompt_version contains unsupported characters")
+        words = [str(word) for word in words]
+        typed_candidates = validate_rerank_candidates(candidates, words)
+        image_paths, prepared_images = self._prepare_images(image_paths)
+        decodable_ids = {
+            index for index, data_url in enumerate(prepared_images) if data_url is not None
+        }
+        if valid_image_ids is not None:
+            requested_image_ids = list(valid_image_ids)
+            if any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in requested_image_ids
+            ):
+                raise ValueError("valid_image_ids must contain integers")
+            requested_ids = set(requested_image_ids)
+            decodable_ids &= requested_ids
+            prepared_images = [
+                data_url if index in decodable_ids else None
+                for index, data_url in enumerate(prepared_images)
+            ]
+        manifest = "\n".join(
+            f"{index}: {json.dumps(path.name, ensure_ascii=False)}"
+            for index, path in enumerate(image_paths)
+            if index in decodable_ids and path is not None
+        )
+        if not manifest:
+            manifest = "[no decodable images]"
+        user_text = build_rerank_user_prompt(words, typed_candidates, manifest)
+        candidate_spans = {
+            candidate.candidate_id: [
+                (entity.start, entity.end) for entity in candidate.entities
+            ]
+            for candidate in typed_candidates
+        }
+        allowed_ids = tuple(candidate_spans)
 
-        content = payload["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(
-                item.get("text", "") for item in content if isinstance(item, dict)
+        def validate(payload: dict[str, Any]) -> RerankDecision:
+            return validate_rerank_output(
+                payload,
+                allowed_ids,
+                decodable_ids,
+                token_count=len(words),
+                candidate_spans=candidate_spans,
             )
-        content = str(content).strip()
-        fence = chr(96) * 3
-        if content.startswith(fence):
-            content = content.strip(chr(96))
-            if content.startswith("json"):
-                content = content[4:].lstrip()
-        start, end = content.find("{"), content.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("teacher response did not contain a JSON object")
-        return json.loads(content[start : end + 1])
+
+        result = self._complete_prepared_json(
+            f"{RERANK_SYSTEM_PROMPT}\nProtocol version: {prompt_version}.",
+            user_text,
+            prepared_images,
+            validator=validate,
+        )
+        assert isinstance(result, RerankDecision)
+        return result
 

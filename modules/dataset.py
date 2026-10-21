@@ -73,6 +73,37 @@ class MnerProcessor:
 
         return {"words": words, "labels": labels, "images": images}
 
+    def load_unlabeled_examples(self, file_name: str) -> dict[str, list[Any]]:
+        """Load only fields available at inference time.
+
+        Keeping this loader separate from :meth:`load_examples` makes it
+        impossible for candidate generation to consume the NER labels by
+        accident.  The source format may still contain a ``label`` member, but
+        it is deliberately never indexed here.
+        """
+        words: list[list[str]] = []
+        images: list[list[str]] = []
+        file_path = self.data_path / file_name
+
+        with file_path.open("r", encoding="utf-8") as data_file:
+            for line_number, line in enumerate(data_file, start=1):
+                try:
+                    record = ast.literal_eval(line)
+                    text = record["text"]
+                    image_names = record["images"]
+                except (KeyError, SyntaxError, ValueError) as error:
+                    raise ValueError(
+                        f"Invalid inference record in {file_path} at line {line_number}."
+                    ) from error
+                if not isinstance(text, list) or not isinstance(image_names, list):
+                    raise ValueError(
+                        f"Text and images must be lists in {file_path} at line {line_number}."
+                    )
+                words.append(normalize_words(text))
+                images.append([str(name) for name in image_names])
+
+        return {"words": words, "images": images}
+
     @staticmethod
     def get_label_mapping(include_subword_label: bool = False) -> dict[str, int]:
         """Return the model label-to-index mapping."""
@@ -214,5 +245,67 @@ class MultimodalNerDataset(Dataset[tuple[torch.Tensor, ...]]):
             image_pixel_values,
             labels,
             image_mask,
+        )
+
+
+class MultimodalInferenceDataset(MultimodalNerDataset):
+    """Inference-only view that never loads NER labels from the source file."""
+
+    def __init__(self, args: Any, file_name: str) -> None:
+        self.max_sequence_length = args.max_seq_length
+        self.processor = MnerProcessor(args)
+        self.image_processor = ViTImageProcessor.from_pretrained(args.vit_model)
+        self.examples = self.processor.load_unlabeled_examples(file_name)
+        self.tokenizer = self.processor.tokenizer
+        self.label_mapping = self.processor.get_label_mapping(include_subword_label=True)
+        self.image_path = Path(args.image_path)
+        self.twitter2017_image_path = Path(args.twitter2017_image_path)
+
+    def token_structure(self, index: int) -> tuple[torch.Tensor, list[str], list[int]]:
+        """Return special/continuation positions and retained input words.
+
+        The structure is derived only from the tokenizer.  A word is retained
+        when at least its first WordPiece fits in the model's input window,
+        matching the flat-token truncation used by ``_encode_text``.
+        """
+        token_budget = self.max_sequence_length - 2
+        used_tokens = 0
+        structure = [True]  # CLS
+        retained_words: list[str] = []
+        retained_word_indices: list[int] = []
+        for word_index, word in enumerate(self.examples["words"][index]):
+            pieces = self.tokenizer.tokenize(normalize_unicode_text(word))
+            if not pieces:
+                continue
+            remaining = token_budget - used_tokens
+            if remaining <= 0:
+                break
+            retained_count = min(len(pieces), remaining)
+            retained_words.append(word)
+            retained_word_indices.append(word_index)
+            structure.extend([False, *([True] * (retained_count - 1))])
+            used_tokens += retained_count
+            if used_tokens == token_budget:
+                break
+        structure.append(True)  # SEP
+
+        padded = torch.zeros(self.max_sequence_length, dtype=torch.bool)
+        padded[: len(structure)] = torch.tensor(structure, dtype=torch.bool)
+        return padded, retained_words, retained_word_indices
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        word_list = self.examples["words"][index]
+        image_pixel_values, image_mask = self._encode_images(self.examples["images"][index])
+        input_ids, token_type_ids, attention_mask, _ = self._encode_text(
+            word_list,
+            ["O"] * len(word_list),
+        )
+        return (
+            input_ids,
+            token_type_ids,
+            attention_mask,
+            image_pixel_values,
+            image_mask,
+            torch.tensor(index, dtype=torch.long),
         )
 

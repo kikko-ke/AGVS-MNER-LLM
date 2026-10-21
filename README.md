@@ -6,19 +6,141 @@
 
 已完成的验证集图片消融为：完整图片 `0.8179`、关闭图片 `0.8152`、按相同图片掩码打乱图片 `0.8170`。正确图文对应相对随机图片只增加约 `0.00087` F1，因此当前 AGVS checkpoint 的主要视觉增益来自通用视觉偏置，而不是图片语义。继续调 grounding fusion、utility gate 或 LGEI 不再作为性能主线，也不需要继续生成教师缓存。
 
-下一阶段先做**无 API 成本**的 CRF top-k 上限审计。脚本从模型 emissions 和 CRF 转移分数生成候选；CLS、SEP 和 WordPiece 结构位置只由 tokenizer 推导，候选生成不读取 gold 实体。候选经合法 BIO 投影和去重后，使用 Dinkelbach 算法精确计算语料级 micro-F1 oracle：
+CRF top-k 上限审计已经通过。严格基线验证 F1 为 `0.8179`，oracle@3 为 `0.8803`、oracle@5 为 `0.8977`、oracle@10 为 `0.9128`。这说明正确序列经常已经存在于前五个候选中，当前主要问题是排序。下一阶段采用 **MLLM 受约束 CRF 重排**：Qwen3-VL 只能从五个完整 BIO 候选中选择一个，不能生成或修改实体。
+
+整个流程分为三个互相隔离的阶段：候选导出不读取 `label`，LLM 请求只读取候选、文本与图片，最后的评估脚本才读取 gold。候选以不透明 ID 和确定性随机顺序展示，提示词不会暴露 CRF 排名或分数。缺失/非法响应、低置信度、`uncertain=true` 或决策 provenance 不匹配时回退到 CRF top-1；候选 artifact 自身的 hash/provenance 损坏时直接中止，避免继续评估不可追溯的数据。
+
+先在验证集导出全部 top-5 候选。默认从 100 个最低 CRF margin 样本和 100 个固定随机控制样本组成 200 次请求的 pilot：
 
 ```bash
-python -u scripts/evaluate_crf_topk_oracle.py \
-  --checkpoint /path/to/best_model.pt \
+cd /root/autodl-tmp/AGVS-MNER-LLM
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+set -o pipefail
+
+test -n "$LLM_BASE_URL" || { echo "缺少 LLM_BASE_URL"; exit 1; }
+test -n "$LLM_API_KEY"  || { echo "缺少 LLM_API_KEY"; exit 1; }
+test -n "$LLM_MODEL"    || { echo "缺少 LLM_MODEL"; exit 1; }
+
+BASELINE=/path/to/strict_baseline/best_model.pt
+test -f "$BASELINE" || { echo "找不到基线 checkpoint"; exit 1; }
+
+mkdir -p rerank_cache/qwen3vl32b_top5 logs
+
+python -u scripts/export_crf_rerank_candidates.py \
+  --checkpoint "$BASELINE" \
   --split val \
-  --ks 1 3 5 10 \
+  --k 5 \
+  --oversample-factor 20 \
+  --uncertainty-queries 100 \
+  --random-control-queries 100 \
+  --route-seed 20261020 \
+  --output rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
   --device cuda \
   --batch-size 4 \
-  --num-workers 4
+  --num-workers 4 \
+  2>&1 | tee logs/export_rerank_val.log
+
+python -u scripts/build_llm_rerank_cache.py \
+  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --output rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --scope pilot \
+  --resume \
+  2>&1 | tee -a logs/rerank_pilot.log
+
+python -u scripts/evaluate_llm_reranker.py \
+  --input dataset/text/MNER-UNI_val.txt \
+  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --decisions rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --confidence-thresholds 0.80 0.85 0.90 0.95 \
+  --output rerank_cache/qwen3vl32b_top5/pilot_metrics.json \
+  2>&1 | tee logs/evaluate_rerank_pilot.log
 ```
 
-若 `exact_corpus_micro_f1_oracle@10 < 0.86`，top-k 重排理论上不能达到 0.86，应停止该路线并先增强基线。若 oracle@5 至少达到约 `0.86–0.87`，再用 200 条验证样本做 Qwen3-VL 受约束候选重排 pilot；LLM 只能选择现有候选，不能生成新实体。
+pilot 的 go/no-go 门槛为：实现这 200 条路由样本 oracle 增益的至少 `60%`，并保留至少 `95%` 原本 top-1 完全正确的样本。100 条低 margin 与 100 条随机样本只是分层 pilot 抽样；正式方法对全部样本调用受约束重排，再由冻结的置信度策略决定采用候选还是回退 top-1。
+
+选择一个已经通过门槛的阈值（下面以 `0.90` 为例），重新执行评估并写出不可变 policy：
+
+```bash
+FROZEN_THRESHOLD=0.90
+
+python -u scripts/evaluate_llm_reranker.py \
+  --input dataset/text/MNER-UNI_val.txt \
+  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --decisions rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --confidence-thresholds "$FROZEN_THRESHOLD" \
+  --freeze-policy rerank_cache/qwen3vl32b_top5/frozen_policy.json \
+  --frozen-threshold "$FROZEN_THRESHOLD" \
+  2>&1 | tee logs/freeze_rerank_policy.log
+
+python -u scripts/build_llm_rerank_cache.py \
+  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --output rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --scope all \
+  --policy rerank_cache/qwen3vl32b_top5/frozen_policy.json \
+  --resume \
+  2>&1 | tee -a logs/rerank_val_all.log
+
+python -u scripts/evaluate_llm_reranker.py \
+  --input dataset/text/MNER-UNI_val.txt \
+  --candidates rerank_cache/qwen3vl32b_top5/val_candidates.jsonl \
+  --decisions rerank_cache/qwen3vl32b_top5/val_decisions.jsonl \
+  --scope all \
+  --policy rerank_cache/qwen3vl32b_top5/frozen_policy.json \
+  --output rerank_cache/qwen3vl32b_top5/val_full_metrics.json \
+  2>&1 | tee logs/evaluate_rerank_val_all.log
+```
+
+只有完整验证集仍支持方案时才执行一次正式测试。三个测试阶段都要求显式解锁；builder/evaluator 强制 `scope=all`，evaluator 只使用 policy 中唯一的冻结阈值：
+
+```bash
+python -u scripts/export_crf_rerank_candidates.py \
+  --checkpoint "$BASELINE" \
+  --split test \
+  --allow-test \
+  --k 5 \
+  --oversample-factor 20 \
+  --output rerank_cache/qwen3vl32b_top5/test_candidates.jsonl \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  2>&1 | tee logs/export_rerank_test.log
+
+python -u scripts/build_llm_rerank_cache.py \
+  --candidates rerank_cache/qwen3vl32b_top5/test_candidates.jsonl \
+  --output rerank_cache/qwen3vl32b_top5/test_decisions.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --scope all \
+  --policy rerank_cache/qwen3vl32b_top5/frozen_policy.json \
+  --allow-test \
+  --resume \
+  2>&1 | tee logs/rerank_test.log
+
+python -u scripts/evaluate_llm_reranker.py \
+  --input dataset/text/MNER-UNI_test.txt \
+  --candidates rerank_cache/qwen3vl32b_top5/test_candidates.jsonl \
+  --decisions rerank_cache/qwen3vl32b_top5/test_decisions.jsonl \
+  --scope all \
+  --policy rerank_cache/qwen3vl32b_top5/frozen_policy.json \
+  --allow-test \
+  --output rerank_cache/qwen3vl32b_top5/test_metrics.json \
+  2>&1 | tee logs/evaluate_rerank_test.log
+```
 
 ## 历史 LGEI 实验
 
@@ -43,15 +165,20 @@ LGEI（LLM-Guided Evidence Intervention，LLM 引导证据干预）的设计为�
 - `modules/llm_dataset.py`：教师缓存校验和实体图片目标构建
 - `modules/llm_trainer.py`：证据路由、双视图 CRF 与一致性损失
 - `modules/crf_topk.py`：CRF top-k 解码与精确语料级 micro-F1 oracle
+- `modules/crf_candidates.py`：无 gold 的结构约束、WordPiece 到词级候选转换
+- `modules/reranker.py`：不透明候选、pilot 路由、provenance 与安全回退策略
 - `modules/trainer.py`：训练、验证、epoch-0 回退和 checkpoint 管理
 - `scripts/build_teacher_cache.py`：离线生成教师缓存
 - `scripts/audit_llm_grounding.py`：审计缓存覆盖、类别和证据模式
 - `scripts/evaluate_crf_topk_oracle.py`：评估受约束 LLM 重排的候选空间上限
+- `scripts/export_crf_rerank_candidates.py`：导出不含 gold 的 top-5 候选
+- `scripts/build_llm_rerank_cache.py`：生成可断点续传的 Qwen 候选选择缓存
+- `scripts/evaluate_llm_reranker.py`：唯一读取 gold 的候选重排评估阶段
 - `run.py`：原始 AGVS 基线入口
 - `run_llm.py`：LLM 监督训练入口
 - `docs/research_plan.md`：方法、实验协议与消融
 
-## 训练前检查
+## 历史 LGEI 训练前检查
 
 完整 UNI grounding 缓存应覆盖 10,227/10,229 个训练样本。先运行：
 
