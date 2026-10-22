@@ -45,7 +45,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument(
+        "--split",
+        choices=("train", "val", "meta", "test"),
+        default="val",
+        help="Dataset suffix used when --input-file is omitted.",
+    )
+    parser.add_argument(
+        "--input-file",
+        help="Custom inference file, such as the held-out atomic preflight meta pool.",
+    )
+    parser.add_argument(
+        "--split-label",
+        help="Provenance label for --input-file (for example meta or fold-0-meta).",
+    )
     parser.add_argument(
         "--allow-test",
         action="store_true",
@@ -70,7 +83,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     cli = parse_args()
-    if cli.split == "test" and not cli.allow_test:
+    split_label = cli.split_label or cli.split
+    custom_input = Path(cli.input_file) if cli.input_file else None
+    custom_is_test = (
+        custom_input is not None and custom_input.name.lower().endswith("_test.txt")
+    )
+    if custom_is_test and split_label != "test":
+        raise ValueError("An official *_test.txt input must use --split-label test")
+    official_test = split_label == "test" or custom_is_test
+    if official_test and not cli.allow_test:
         raise ValueError(
             "Test export is locked during development; freeze the prompt/route/policy "
             "and pass --allow-test for the single final evaluation."
@@ -92,6 +113,10 @@ def main() -> None:
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["device"] = cli.device
+    if custom_input is not None:
+        if not custom_input.is_file():
+            raise FileNotFoundError(custom_input)
+        config["data_path"] = str(custom_input.parent)
     if cli.batch_size is not None:
         config["batch_size"] = cli.batch_size
     if cli.num_workers is not None:
@@ -101,14 +126,18 @@ def main() -> None:
         raise RuntimeError("CUDA requested but unavailable; use --device cpu")
     set_seed(int(getattr(args, "seed", 1234)))
 
-    file_name = f"MNER-{args.dataset}_{cli.split}.txt"
+    file_name = (
+        custom_input.name
+        if custom_input is not None
+        else f"MNER-{args.dataset}_{cli.split}.txt"
+    )
     input_path = Path(args.data_path) / file_name
     input_sha256 = sha256_inference_projection(input_path)
     checkpoint_sha256 = sha256_file(checkpoint)
     provenance = build_candidate_provenance(
         checkpoint_sha256=checkpoint_sha256,
         input_sha256=input_sha256,
-        split=cli.split,
+        split=split_label,
         candidate_count=cli.k,
         decode_count=cli.k * cli.oversample_factor,
     )
@@ -225,7 +254,7 @@ def main() -> None:
                     "prompt_version": RERANK_PROMPT_VERSION,
                     "provenance": provenance,
                     "sample_id": sample_id,
-                    "split": cli.split,
+                    "split": split_label,
                     "checkpoint_sha256": checkpoint_sha256,
                     "input_sha256": input_sha256,
                     "k": cli.k,
@@ -279,7 +308,7 @@ def main() -> None:
         "input": str(input_path),
         "input_sha256": input_sha256,
         "input_hash_scope": "ordered text+images projection",
-        "split": cli.split,
+        "split": split_label,
         "k": cli.k,
         "decode_k": decode_k,
         "samples": len(records),

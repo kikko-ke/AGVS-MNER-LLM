@@ -1,6 +1,14 @@
-# 研究计划：MLLM 受约束 CRF 候选重排
+# 研究计划：MLLM 原子编辑审查与保守校准
 
-## 当前主方法
+## 当前主方法：V3 原子编辑审查
+
+V2 整序列五选一未达到 go/no-go。V3 保留 top-5 候选覆盖，只提取相对 CRF top-1 的四类严格单实体修改：删除误检、添加漏检、同边界类型修改、同类型重叠边界修改。Qwen3-VL 独立输出每个固定编辑的 `KEEP_BASELINE/APPLY_EDIT/ABSTAIN`、文本支持、视觉支持、引用图片和决定性 span。LLM 不生成 BIO 序列，也不直接作最终选择。
+
+监督校准器使用 CRF 结构特征和 LLM 结构化字段，回归语料级 F1 的 Dinkelbach 编辑增益，同时预测 beneficial/neutral/harmful。推理时每条样本最多接受一个编辑；schema、fingerprint、数据 hash 或预测异常均回退 top-1。训练目标和 policy 阈值分别来自 `meta_train` 与 `meta_calibration`，最终 go/no-go 只在 `meta_evaluation` 执行。
+
+原训练集固定拆为 72% `base_train`、8% `base_dev`、20% `meta`，基础模型不接触 meta；meta 再按 60/20/20 拆分。官方 validation/test 在 preflight 通过前保持封存。严格单编辑 oracle 为 `0.8867`，最低 margin 800 条路由 oracle 为 `0.8686`，所以主方案的 go/no-go 为：至少实现 `60%` 原子 oracle 增益、保持 `98%` 原本完全正确的 top-1、有益编辑多于有害编辑、full 比独立训练的 structure-only 对照至少高 `0.003` F1。完整操作命令见 README。
+
+## 历史 V2：整序列候选重排
 
 严格基线验证 F1 为 `0.8179`。CRF 候选审计得到 oracle@3 `0.8803`、oracle@5 `0.8977`、oracle@10 `0.9128`；top-1 的 483 个实体集合错误样本中，top-5 可完整恢复 172 个。K=5 在候选复杂度和理论余量之间最合适：达到 `0.86` 需要实现约 `53%` 的完整 top-5 oracle 增益。
 

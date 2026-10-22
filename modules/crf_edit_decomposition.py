@@ -149,6 +149,38 @@ def is_atomic_entity_edit(
     return False
 
 
+def describe_atomic_entity_edit(
+    top1_entities: Iterable[tuple[Any, Any, Any]],
+    alternative_entities: Iterable[tuple[Any, Any, Any]],
+) -> dict[str, Any] | None:
+    """Describe one strict atomic alternative using only candidate content.
+
+    The returned object is deliberately JSON-compatible so it can be written
+    directly to a gold-free candidate artifact and shown to an LLM.  ``None``
+    means that the alternative is unchanged, mixed, or changes more than one
+    entity.  Gold labels are neither accepted nor consulted here.
+    """
+    top1 = _normalize_entities(top1_entities)
+    alternative = _normalize_entities(alternative_entities)
+    edit_class = classify_entity_edit(top1, alternative)
+    if not is_atomic_entity_edit(top1, alternative, edit_class):
+        return None
+
+    removed = sorted(top1 - alternative)
+    added = sorted(alternative - top1)
+
+    def serialize(entity: Entity) -> dict[str, Any]:
+        start, end, label = entity
+        return {"start": start, "end": end, "label": label}
+
+    return {
+        "edit_class": edit_class,
+        "removed_entity": serialize(removed[0]) if removed else None,
+        "added_entity": serialize(added[0]) if added else None,
+        "is_atomic": True,
+    }
+
+
 def _entity_counts(gold: EntitySet, prediction: EntitySet) -> EntityCounts:
     return (
         len(gold & prediction),

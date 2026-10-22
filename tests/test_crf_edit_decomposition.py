@@ -14,6 +14,7 @@ from modules.crf_edit_decomposition import (
     UNCHANGED,
     classify_entity_edit,
     decompose_topk_edit_oracles,
+    describe_atomic_entity_edit,
     is_atomic_entity_edit,
 )
 
@@ -76,6 +77,65 @@ def test_atomic_entity_edits_reject_multi_entity_changes() -> None:
         top1,
         {(0, 2, "PER"), (3, 5, "ORG")},
     )
+
+
+@pytest.mark.parametrize(
+    ("alternative", "edit_class", "removed", "added"),
+    [
+        (
+            {(0, 1, "PER")},
+            DELETION,
+            {"start": 3, "end": 4, "label": "ORG"},
+            None,
+        ),
+        (
+            {(0, 1, "PER"), (3, 4, "ORG"), (6, 7, "MIS")},
+            ADDITION,
+            None,
+            {"start": 6, "end": 7, "label": "MIS"},
+        ),
+        (
+            {(0, 1, "LOC"), (3, 4, "ORG")},
+            TYPE_CHANGE,
+            {"start": 0, "end": 1, "label": "PER"},
+            {"start": 0, "end": 1, "label": "LOC"},
+        ),
+        (
+            {(0, 2, "PER"), (3, 4, "ORG")},
+            BOUNDARY_CHANGE,
+            {"start": 0, "end": 1, "label": "PER"},
+            {"start": 0, "end": 2, "label": "PER"},
+        ),
+    ],
+)
+def test_describes_each_strict_atomic_entity_edit(
+    alternative,
+    edit_class,
+    removed,
+    added,
+) -> None:
+    top1 = {(0, 1, "PER"), (3, 4, "ORG")}
+
+    assert describe_atomic_entity_edit(top1, alternative) == {
+        "edit_class": edit_class,
+        "removed_entity": removed,
+        "added_entity": added,
+        "is_atomic": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "alternative",
+    [
+        {(0, 1, "PER"), (3, 4, "ORG")},
+        set(),
+        {(0, 1, "LOC"), (3, 4, "MIS")},
+        {(0, 2, "PER"), (3, 5, "ORG")},
+    ],
+)
+def test_atomic_edit_description_rejects_unchanged_or_multi_edits(alternative) -> None:
+    top1 = {(0, 1, "PER"), (3, 4, "ORG")}
+    assert describe_atomic_entity_edit(top1, alternative) is None
 
 
 def test_edit_oracles_allow_only_one_class_plus_top1() -> None:

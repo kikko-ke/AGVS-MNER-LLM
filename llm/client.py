@@ -18,7 +18,16 @@ from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 from PIL import Image, UnidentifiedImageError
 
+from llm.atomic_review_schema import (
+    AtomicReviewResponse,
+    validate_atomic_baseline_entities,
+    validate_atomic_edit_candidates,
+    validate_atomic_edits_against_baseline,
+    validate_atomic_review_output,
+)
 from llm.prompts import (
+    ATOMIC_REVIEW_PROMPT_VERSION,
+    ATOMIC_REVIEW_SYSTEM_PROMPT,
     GROUNDING_SYSTEM_PROMPT,
     GROUNDING_USER_TEMPLATE,
     RERANK_PROMPT_VERSION,
@@ -27,6 +36,7 @@ from llm.prompts import (
     UTILITY_SYSTEM_PROMPT,
     UTILITY_USER_TEMPLATE,
     USER_TEMPLATE,
+    build_atomic_review_user_prompt,
     build_rerank_user_prompt,
 )
 from llm.rerank_schema import (
@@ -413,5 +423,82 @@ class LLMTeacherClient:
             validator=validate,
         )
         assert isinstance(result, RerankDecision)
+        return result
+
+    def complete_atomic_review_json(
+        self,
+        words: Sequence[str],
+        image_paths: Iterable[Path | None],
+        edits: Iterable[Mapping[str, Any]],
+        *,
+        valid_image_ids: Iterable[int] | None = None,
+        prompt_version: str = ATOMIC_REVIEW_PROMPT_VERSION,
+    ) -> AtomicReviewResponse:
+        """Review every strict atomic edit independently of the other edits."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", prompt_version):
+            raise ValueError("prompt_version contains unsupported characters")
+        words = [str(word) for word in words]
+        raw_edits = list(edits)
+        typed_edits = validate_atomic_edit_candidates(raw_edits, words)
+        typed_baselines = []
+        for raw_edit in raw_edits:
+            if "baseline_entities" not in raw_edit:
+                raise ValueError("each atomic edit must carry baseline_entities")
+            raw_baseline = raw_edit["baseline_entities"]
+            if not isinstance(raw_baseline, list):
+                raise ValueError("baseline_entities must be a list")
+            typed_baselines.append(
+                validate_atomic_baseline_entities(raw_baseline, words)
+            )
+        if any(baseline != typed_baselines[0] for baseline in typed_baselines[1:]):
+            raise ValueError("all atomic edits must carry the same baseline_entities")
+        typed_baseline = typed_baselines[0]
+        validate_atomic_edits_against_baseline(typed_edits, typed_baseline)
+
+        image_paths, prepared_images = self._prepare_images(image_paths)
+        decodable_ids = {
+            index for index, data_url in enumerate(prepared_images) if data_url is not None
+        }
+        if valid_image_ids is not None:
+            requested_image_ids = list(valid_image_ids)
+            if any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in requested_image_ids
+            ):
+                raise ValueError("valid_image_ids must contain integers")
+            decodable_ids &= set(requested_image_ids)
+            prepared_images = [
+                data_url if index in decodable_ids else None
+                for index, data_url in enumerate(prepared_images)
+            ]
+        manifest = "\n".join(
+            f"{index}: {json.dumps(path.name, ensure_ascii=False)}"
+            for index, path in enumerate(image_paths)
+            if index in decodable_ids and path is not None
+        )
+        if not manifest:
+            manifest = "[no decodable images]"
+        user_text = build_atomic_review_user_prompt(
+            words,
+            typed_baseline,
+            typed_edits,
+            manifest,
+        )
+
+        def validate(payload: dict[str, Any]) -> AtomicReviewResponse:
+            return validate_atomic_review_output(
+                payload,
+                typed_edits,
+                decodable_ids,
+                token_count=len(words),
+            )
+
+        result = self._complete_prepared_json(
+            f"{ATOMIC_REVIEW_SYSTEM_PROMPT}\nProtocol version: {prompt_version}.",
+            user_text,
+            prepared_images,
+            validator=validate,
+        )
+        assert isinstance(result, AtomicReviewResponse)
         return result
 

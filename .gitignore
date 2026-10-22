@@ -15,9 +15,16 @@ env/
 # 训练产物
 outputs/
 outputs_llm/
+outputs_atomic/
 teacher_cache/
+rerank_cache/
+atomic_cache/
 checkpoints/
 *.log
+
+# Local/sandbox test artifacts
+pytest-cache-files-*/
+.pytest_tmp*/
 
 # 数据集（大数据，不入库）
 dataset/

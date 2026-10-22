@@ -2,7 +2,151 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前研究结论与下一阶段
+## 当前主线：V3 原子编辑审查与监督校准
+
+CRF top-5 的正确序列覆盖充分，但让 Qwen3-VL 直接选择整条序列会破坏大量本来正确的 top-1。V3 将每个候选分解为严格的单实体原子编辑：删除误检实体、补回漏检实体、同边界类型替换、同类型重叠边界替换。Qwen3-VL 只独立审查每个固定编辑，并输出结构化证据；它不能生成实体、改写候选或直接决定最终序列。一个小型监督校准器结合 CRF margin、编辑结构和 LLM 结构化审查特征，最多接受一个编辑，否则回退 CRF top-1。
+
+严格验证集审计得到：基线 F1 `0.8179`，全部 top-5 oracle `0.8977`，只允许上述四类单一原子编辑时 oracle 仍为 `0.8867`；最低 margin 的 800 条路由样本 oracle 为 `0.8686`。因此候选空间足以超过 `0.86`，实际模型仍须在无泄漏 preflight 中实现至少 `60%` 原子 oracle 增益，才进入正式验证。
+
+### 1. 创建无泄漏 preflight 划分
+
+只拆分原训练集：72% 训练基础模型，8% 选择基础模型，20% 生成基础模型未见过的 meta 预测。meta 再固定拆为 60% 校准器训练、20% policy 校准、20% 独立 go/no-go 评估。官方 validation/test 不参与这个阶段。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+
+python -u scripts/create_atomic_preflight_split.py \
+  --input dataset/text/MNER-UNI_train.txt \
+  --output-dir dataset/atomic_preflight_seed20261022 \
+  --dataset UNI \
+  --seed 20261022
+```
+
+### 2. 训练只在 72/8 划分上选择的基础模型
+
+```bash
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python -u run.py \
+  --dataset UNI \
+  --data-path dataset/atomic_preflight_seed20261022 \
+  --image-path dataset/images \
+  --twitter2017-image-path dataset/twitter2017_images \
+  --bert-model /root/autodl-tmp/pretrained_models/bert-base-uncased \
+  --vit-model /root/autodl-tmp/pretrained_models/ViTB-16 \
+  --output-dir outputs_atomic/preflight_base_seed20261022 \
+  --device cuda \
+  --num-epochs 15 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --lr 5e-5 \
+  --bert-lr 1e-5 \
+  --vit-lr 5e-6 \
+  --warmup-ratio 0.01 \
+  --weight-decay 0.01 \
+  --patience 3 \
+  --seed 20261022 \
+  --skip-test
+
+BASE_PRE=$(ls -dt outputs_atomic/preflight_base_seed20261022/uni_* | head -1)/best_model.pt
+test -f "$BASE_PRE" || { echo "找不到 preflight checkpoint"; exit 1; }
+echo "$BASE_PRE"
+```
+
+### 3. 导出 meta 原子候选并请求 1,000 条 LLM 审查
+
+候选导出和 LLM 请求均不读取 gold label。`--route-queries 1000` 只审查原子 margin 最低的 1,000 条样本；缓存支持 `--resume`。
+
+```bash
+mkdir -p atomic_cache/qwen3vl32b_v3 logs
+
+python -u scripts/export_atomic_edit_candidates.py \
+  --checkpoint "$BASE_PRE" \
+  --input-file dataset/atomic_preflight_seed20261022/MNER-UNI_meta.txt \
+  --source-ids dataset/atomic_preflight_seed20261022/MNER-UNI_meta.txt.source_ids.json \
+  --output atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --split-label meta \
+  --k 5 \
+  --oversample-factor 20 \
+  --route-queries 1000 \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  2>&1 | tee logs/export_atomic_meta.log
+
+test -n "$LLM_BASE_URL" || { echo "缺少 LLM_BASE_URL"; exit 1; }
+test -n "$LLM_API_KEY"  || { echo "缺少 LLM_API_KEY"; exit 1; }
+test -n "$LLM_MODEL"    || { echo "缺少 LLM_MODEL"; exit 1; }
+
+python -u scripts/build_llm_atomic_review_cache.py \
+  --candidates atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --output atomic_cache/qwen3vl32b_v3/meta_reviews.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --timeout 300 \
+  --max-tokens 1024 \
+  --max-retries 5 \
+  --request-delay 1 \
+  --scope routed \
+  --resume \
+  2>&1 | tee -a logs/atomic_review_meta.log
+```
+
+### 4. 构建监督样本，训练 full 与 structure-only 对照
+
+下面的 gold-aware builder 是唯一读取 meta gold 的阶段。Dinkelbach `q` 只用 `meta_train` 的 top-1 计数估计；`meta_calibration` 只选择阈值，`meta_evaluation` 只做最终 preflight 评估。
+
+```bash
+python -u scripts/build_atomic_calibrator_data.py \
+  --input dataset/atomic_preflight_seed20261022/MNER-UNI_meta.txt \
+  --candidates atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --reviews atomic_cache/qwen3vl32b_v3/meta_reviews.jsonl \
+  --manifest dataset/atomic_preflight_seed20261022/atomic_preflight_manifest.json \
+  --output atomic_cache/qwen3vl32b_v3/calibrator_examples.jsonl
+
+python -u scripts/train_atomic_calibrator.py \
+  --data atomic_cache/qwen3vl32b_v3/calibrator_examples.jsonl \
+  --output atomic_cache/qwen3vl32b_v3/full_calibrator.pt \
+  --policy-output atomic_cache/qwen3vl32b_v3/full_policy.json \
+  --feature-mode full \
+  --epochs 300 \
+  --minimum-top1-preservation 0.98 \
+  --seed 20261022 \
+  --device cpu
+
+python -u scripts/train_atomic_calibrator.py \
+  --data atomic_cache/qwen3vl32b_v3/calibrator_examples.jsonl \
+  --output atomic_cache/qwen3vl32b_v3/structure_calibrator.pt \
+  --policy-output atomic_cache/qwen3vl32b_v3/structure_policy.json \
+  --feature-mode structure-only \
+  --epochs 300 \
+  --minimum-top1-preservation 0.98 \
+  --seed 20261022 \
+  --device cpu
+```
+
+### 5. 只在独立 meta-evaluation 上作 go/no-go 决策
+
+```bash
+python -u scripts/evaluate_atomic_calibrator.py \
+  --data atomic_cache/qwen3vl32b_v3/calibrator_examples.jsonl \
+  --checkpoint atomic_cache/qwen3vl32b_v3/full_calibrator.pt \
+  --policy atomic_cache/qwen3vl32b_v3/full_policy.json \
+  --structure-checkpoint atomic_cache/qwen3vl32b_v3/structure_calibrator.pt \
+  --structure-policy atomic_cache/qwen3vl32b_v3/structure_policy.json \
+  --role meta_evaluation \
+  --device cpu \
+  --output atomic_cache/qwen3vl32b_v3/meta_evaluation.json \
+  2>&1 | tee logs/evaluate_atomic_meta.log
+```
+
+`go_no_go.passed=true` 同时要求：实现至少 `60%` 的本路由原子 oracle 增益、保留至少 `98%` 原本完全正确的 top-1、接受的有益编辑多于有害编辑，并且 full 模型比独立训练的 structure-only 对照高至少 `0.003` F1。未通过时停止，不访问官方 validation/test，也不宣称达到 `0.86`。
+
+## 历史 V2：直接 top-k 重排
 
 已完成的验证集图片消融为：完整图片 `0.8179`、关闭图片 `0.8152`、按相同图片掩码打乱图片 `0.8170`。正确图文对应相对随机图片只增加约 `0.00087` F1，因此当前 AGVS checkpoint 的主要视觉增益来自通用视觉偏置，而不是图片语义。继续调 grounding fusion、utility gate 或 LGEI 不再作为性能主线，也不需要继续生成教师缓存。
 
@@ -168,7 +312,9 @@ LGEI（LLM-Guided Evidence Intervention，LLM 引导证据干预）的设计为�
 - `modules/llm_trainer.py`：证据路由、双视图 CRF 与一致性损失
 - `modules/crf_topk.py`：CRF top-k 解码与精确语料级 micro-F1 oracle
 - `modules/crf_candidates.py`：无 gold 的结构约束、WordPiece 到词级候选转换
+- `modules/crf_edit_decomposition.py`：将 top-k 差异限制为四类严格单实体编辑
 - `modules/reranker.py`：不透明候选、pilot 路由、provenance 与安全回退策略
+- `modules/atomic_calibrator.py`：原子编辑特征、监督校准器、保守 policy 与 oracle
 - `modules/trainer.py`：训练、验证、epoch-0 回退和 checkpoint 管理
 - `scripts/build_teacher_cache.py`：离线生成教师缓存
 - `scripts/audit_llm_grounding.py`：审计缓存覆盖、类别和证据模式
@@ -176,6 +322,12 @@ LGEI（LLM-Guided Evidence Intervention，LLM 引导证据干预）的设计为�
 - `scripts/export_crf_rerank_candidates.py`：导出不含 gold 的 top-5 候选
 - `scripts/build_llm_rerank_cache.py`：生成可断点续传的 Qwen 候选选择缓存
 - `scripts/evaluate_llm_reranker.py`：唯一读取 gold 的候选重排评估阶段
+- `scripts/create_atomic_preflight_split.py`：建立 72/8/20 和 60/20/20 无泄漏划分
+- `scripts/export_atomic_edit_candidates.py`：无 gold 导出 top-5 严格原子编辑
+- `scripts/build_llm_atomic_review_cache.py`：生成可续传的独立 LLM 编辑审查
+- `scripts/build_atomic_calibrator_data.py`：唯一读取 meta gold 并构建监督目标的阶段
+- `scripts/train_atomic_calibrator.py`：训练校准器并只在 meta-calibration 冻结 policy
+- `scripts/evaluate_atomic_calibrator.py`：在 meta-evaluation 检验 full、结构对照和扰动对照
 - `run.py`：原始 AGVS 基线入口
 - `run_llm.py`：LLM 监督训练入口
 - `docs/research_plan.md`：方法、实验协议与消融
