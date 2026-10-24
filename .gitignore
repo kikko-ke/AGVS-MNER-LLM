@@ -25,6 +25,12 @@ checkpoints/
 # Local/sandbox test artifacts
 pytest-cache-files-*/
 .pytest_tmp*/
+.pytest-*/
+.pytest_atomic_multirole_cases/
+pytest-of-*/
+_pytest_*/
+tmp????????/
+torchinductor_*/
 
 # 数据集（大数据，不入库）
 dataset/

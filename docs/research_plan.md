@@ -1,6 +1,40 @@
 # 研究计划：MLLM 原子编辑审查与保守校准
 
-## 当前主方法：V3 原子编辑审查
+## 当前主方法：V4 单编辑、多角色共识
+
+V3 在已经锁定的 meta evaluation 上未通过：基线 F1 `0.83891`，full 为
+`0.83972`，只实现 `1.55%` 的原子 oracle 增益；full 相对 structure-only
+仅高 `0.00076`。因此旧 `meta_evaluation` 已经暴露并永久封存，不能再参与
+V4 的提示词、路由、投票、阈值或模型选择。
+
+V4 对每个请求只展示一个固定原子编辑，分别调用互相不可见输出的
+`text_verifier`、`visual_verifier` 和 `adversarial_critic`。输出只包含严格
+枚举的 verdict、证据目标、reason code 和有效图片槽位；删除 V3 中失真的
+自报 confidence，也不允许模型生成自由 span 或 BIO 序列。文本角色不会上传
+图片；视觉角色的支持结论必须引用实际可解码图片；critic 的具体反对意见拥有
+否决权。
+
+固定共识为：三个角色完整且 provenance 一致；critic=`NO_OBJECTION`；文本和
+视觉角色均不支持 baseline；二者至少一个明确支持 edit。否则一律回退 CRF
+top-1。每个样本最多选择一个最低 margin 编辑，任何缓存缺失、格式错误、指纹
+失配或角色冲突也回退 top-1。
+
+开发分两步：先在 `meta_train` 固定 20 个样本调通 schema（60 次请求），然后
+冻结协议，在 `meta_calibration` 按无 gold 的最低 margin 规则固定选择 100 个
+不同样本（300 次请求）并只评估一次。通过条件预先锁定为：角色完整覆盖率
+`>=0.95`、accepted `>=20`、beneficial precision `>=0.80`、harmful rate
+`<=0.10`、top-1 exact preservation `>=0.98`、normalized selected-edit oracle
+gain `>=0.50`、语料级 F1 gain `>=0.003`。失败即停止；不得在这 100 条结果上
+反复修改 prompt 后仍称其为独立验证。
+
+若 pilot 通过，正式证据必须重新创建未见 holdout：排除旧 meta 的全部 source
+ID，用新 seed 在原 base pool 中预先抽样并保存 ID/hash；旧 checkpoint 因见过
+这些样本不能用于正式结论，必须从头训练一个排除新 holdout 的基础模型。所有
+V4 协议和策略冻结后才打开新 holdout 的 gold。正式门槛恢复 normalized oracle
+gain `>=0.60`，并增加独立训练的 structure-only 对照，要求 full 至少高
+`0.003` F1。官方 validation/test 已在历史开发中多次查看，只能作为补充报告。
+
+## 历史 V3：原子编辑审查
 
 V2 整序列五选一未达到 go/no-go。V3 保留 top-5 候选覆盖，只提取相对 CRF top-1 的四类严格单实体修改：删除误检、添加漏检、同边界类型修改、同类型重叠边界修改。Qwen3-VL 独立输出每个固定编辑的 `KEEP_BASELINE/APPLY_EDIT/ABSTAIN`、文本支持、视觉支持、引用图片和决定性 span。LLM 不生成 BIO 序列，也不直接作最终选择。
 

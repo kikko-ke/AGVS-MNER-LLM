@@ -2,7 +2,110 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前主线：V3 原子编辑审查与监督校准
+## 当前主线：V4 单编辑、多角色保守共识
+
+V3 已完成并判定为 **no-go**：在旧 `meta_evaluation` 上，完整校准器仅取得
+`+0.00081` F1，只实现约 `1.55%` 的原子 oracle 增益；LLM 自报置信度也没有
+区分有益和有害编辑。该划分的结果已经被查看，因此永久退出 V4 的提示词、
+路由、阈值和模型选择。
+
+V4 保留不变的 CRF top-5 和严格原子编辑候选，但每次 API 请求只展示一个
+编辑，并让三个互相独立的角色审查：
+
+1. `text_verifier`：只接收文本，绝不上传图片；
+2. `visual_verifier`：只有直接可见证据才能支持 baseline 或 edit；
+3. `adversarial_critic`：专门寻找“采用该编辑会出错”的反证。
+
+响应不再包含 LLM 自报 `confidence` 或自由 span。只有三角色齐全、critic 返回
+`NO_OBJECTION`、两个 verifier 都不支持 baseline，且至少一个 verifier 明确支持
+edit 时才接受编辑；任何缺失、冲突、非法输出或 provenance 不匹配都回退 CRF
+top-1。每个样本最多审查并应用一个最低 margin 编辑。
+
+### V4-A：先用 20 条 meta-train 调通协议
+
+这一步共 `20 × 3 = 60` 次请求，只检查格式、图片引用和断点续传，不用于
+选择性能阈值。请求缓存不读取 gold，也不需要 GPU。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+
+test -n "$LLM_BASE_URL" || { echo "缺少 LLM_BASE_URL"; exit 1; }
+test -n "$LLM_API_KEY"  || { echo "缺少 LLM_API_KEY"; exit 1; }
+test -n "$LLM_MODEL"    || { echo "缺少 LLM_MODEL"; exit 1; }
+
+mkdir -p atomic_cache/qwen3vl32b_v4 logs
+set -o pipefail
+
+python -u scripts/build_llm_atomic_multirole_cache.py \
+  --candidates atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --manifest dataset/atomic_preflight_seed20261022/atomic_preflight_manifest.json \
+  --roles meta_train \
+  --route-samples 20 \
+  --max-edits-per-sample 1 \
+  --scope all \
+  --output atomic_cache/qwen3vl32b_v4/meta_train_smoke_reviews.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --timeout 300 \
+  --max-tokens 512 \
+  --max-retries 5 \
+  --request-delay 1 \
+  --resume \
+  2>&1 | tee -a logs/atomic_multirole_meta_train_smoke.log
+
+wc -l atomic_cache/qwen3vl32b_v4/meta_train_smoke_reviews.jsonl
+```
+
+正常完成应为 60 行。中断后原命令再次执行即可从复合主键继续。
+
+### V4-B：冻结协议后运行 100 条 meta-calibration pilot
+
+这一步固定选择 `meta_calibration` 中原子 margin 最低的 100 个不同样本，
+每个样本一个编辑、三个角色，共 300 次请求。评估脚本是唯一读取这些开发集
+gold 的 V4 程序。
+
+```bash
+python -u scripts/build_llm_atomic_multirole_cache.py \
+  --candidates atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --manifest dataset/atomic_preflight_seed20261022/atomic_preflight_manifest.json \
+  --roles meta_calibration \
+  --route-samples 100 \
+  --max-edits-per-sample 1 \
+  --scope all \
+  --output atomic_cache/qwen3vl32b_v4/meta_calibration_reviews.jsonl \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --base-url "$LLM_BASE_URL" \
+  --api-key "$LLM_API_KEY" \
+  --model "$LLM_MODEL" \
+  --timeout 300 \
+  --max-tokens 512 \
+  --max-retries 5 \
+  --request-delay 1 \
+  --resume \
+  2>&1 | tee -a logs/atomic_multirole_meta_calibration.log
+
+python -u scripts/evaluate_atomic_multirole_pilot.py \
+  --input dataset/atomic_preflight_seed20261022/MNER-UNI_meta.txt \
+  --candidates atomic_cache/qwen3vl32b_v3/meta_candidates.jsonl \
+  --reviews atomic_cache/qwen3vl32b_v4/meta_calibration_reviews.jsonl \
+  --manifest dataset/atomic_preflight_seed20261022/atomic_preflight_manifest.json \
+  --meta-role meta_calibration \
+  --output atomic_cache/qwen3vl32b_v4/meta_calibration_evaluation.json \
+  2>&1 | tee logs/evaluate_atomic_multirole_meta_calibration.log
+```
+
+Pilot 预先锁定的通过条件为：完整三角色响应覆盖率至少 `95%`；接受至少 20
+个编辑；接受编辑中 beneficial 至少 `80%`、harmful 不超过 `10%`；正确
+top-1 保持率至少 `98%`；实现所选编辑 oracle 增益至少 `50%`；总 F1 至少
+提高 `0.003`。任一条件失败就停止 V4，不扩大 API 请求，也不访问旧
+`meta_evaluation` 或官方 validation/test。通过后才创建全新的、从未查看的
+holdout，并从头训练不接触该 holdout 的基础模型进行正式确认。
+
+## 历史 V3：原子编辑审查与监督校准
 
 CRF top-5 的正确序列覆盖充分，但让 Qwen3-VL 直接选择整条序列会破坏大量本来正确的 top-1。V3 将每个候选分解为严格的单实体原子编辑：删除误检实体、补回漏检实体、同边界类型替换、同类型重叠边界替换。Qwen3-VL 只独立审查每个固定编辑，并输出结构化证据；它不能生成实体、改写候选或直接决定最终序列。一个小型监督校准器结合 CRF margin、编辑结构和 LLM 结构化审查特征，最多接受一个编辑，否则回退 CRF top-1。
 

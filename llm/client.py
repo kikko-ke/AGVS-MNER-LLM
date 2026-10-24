@@ -18,6 +18,13 @@ from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 from PIL import Image, UnidentifiedImageError
 
+from llm.atomic_multirole_schema import (
+    ATOMIC_MULTIROLE_PROMPT_VERSION,
+    AtomicMultiroleReview,
+    ROLE_TEXT,
+    validate_atomic_multirole_output,
+    validate_atomic_multirole_role,
+)
 from llm.atomic_review_schema import (
     AtomicReviewResponse,
     validate_atomic_baseline_entities,
@@ -26,6 +33,7 @@ from llm.atomic_review_schema import (
     validate_atomic_review_output,
 )
 from llm.prompts import (
+    ATOMIC_MULTIROLE_SYSTEM_PROMPTS,
     ATOMIC_REVIEW_PROMPT_VERSION,
     ATOMIC_REVIEW_SYSTEM_PROMPT,
     GROUNDING_SYSTEM_PROMPT,
@@ -36,6 +44,7 @@ from llm.prompts import (
     UTILITY_SYSTEM_PROMPT,
     UTILITY_USER_TEMPLATE,
     USER_TEMPLATE,
+    build_atomic_multirole_user_prompt,
     build_atomic_review_user_prompt,
     build_rerank_user_prompt,
 )
@@ -500,5 +509,97 @@ class LLMTeacherClient:
             validator=validate,
         )
         assert isinstance(result, AtomicReviewResponse)
+        return result
+
+    def complete_atomic_multirole_json(
+        self,
+        words: Sequence[str],
+        image_paths: Iterable[Path | None],
+        edit: Mapping[str, Any],
+        role: str,
+        valid_image_ids: Iterable[int] | None = None,
+        prompt_version: str = ATOMIC_MULTIROLE_PROMPT_VERSION,
+    ) -> AtomicMultiroleReview:
+        """Run one independent V4 role review for exactly one atomic edit."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", prompt_version):
+            raise ValueError("prompt_version contains unsupported characters")
+        role = validate_atomic_multirole_role(role)
+        words = [str(word) for word in words]
+        if not isinstance(edit, Mapping):
+            raise ValueError("edit must be one atomic edit object")
+        raw_edit = dict(edit)
+        typed_edit = validate_atomic_edit_candidates([raw_edit], words)[0]
+        raw_baseline = raw_edit.get("baseline_entities")
+        if not isinstance(raw_baseline, list):
+            raise ValueError("the atomic edit must carry baseline_entities")
+        typed_baseline = validate_atomic_baseline_entities(raw_baseline, words)
+        validate_atomic_edits_against_baseline((typed_edit,), typed_baseline)
+
+        paths = list(image_paths)
+        requested_ids: set[int] | None = None
+        if valid_image_ids is not None:
+            requested_values = list(valid_image_ids)
+            if any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in requested_values
+            ):
+                raise ValueError("valid_image_ids must contain non-negative integers")
+            if len(requested_values) != len(set(requested_values)):
+                raise ValueError("valid_image_ids must not contain duplicates")
+            requested_ids = set(requested_values)
+
+        if role == ROLE_TEXT:
+            # Preserve reviewer independence: the text verifier never reads, embeds,
+            # names, or transmits an image, even when callers share image arguments.
+            prepared_images: list[str | None] = [None] * len(paths)
+            decodable_ids: set[int] = set()
+        else:
+            paths, prepared_images = self._prepare_images(paths)
+            decodable_ids = {
+                index
+                for index, data_url in enumerate(prepared_images)
+                if data_url is not None
+            }
+            if requested_ids is not None:
+                decodable_ids &= requested_ids
+                prepared_images = [
+                    data_url if index in decodable_ids else None
+                    for index, data_url in enumerate(prepared_images)
+                ]
+
+        manifest = "\n".join(
+            f"{index}: {json.dumps(path.name, ensure_ascii=False)}"
+            for index, path in enumerate(paths)
+            if index in decodable_ids and path is not None
+        )
+        if role == ROLE_TEXT:
+            manifest = "[images intentionally withheld from text_verifier]"
+        elif not manifest:
+            manifest = "[no decodable images]"
+
+        user_text = build_atomic_multirole_user_prompt(
+            words,
+            typed_baseline,
+            typed_edit,
+            role,
+            manifest,
+        )
+
+        def validate(payload: dict[str, Any]) -> AtomicMultiroleReview:
+            return validate_atomic_multirole_output(
+                payload,
+                typed_edit,
+                role,
+                decodable_ids,
+            )
+
+        result = self._complete_prepared_json(
+            f"{ATOMIC_MULTIROLE_SYSTEM_PROMPTS[role]}\n"
+            f"Protocol version: {prompt_version}.",
+            user_text,
+            prepared_images,
+            validator=validate,
+        )
+        assert isinstance(result, AtomicMultiroleReview)
         return result
 
