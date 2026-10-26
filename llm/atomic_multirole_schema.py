@@ -102,7 +102,10 @@ def _strict_image_ids(
         if isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value):
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("used_image_id must be an integer")
+            raise ValueError(
+                "used_image_id must be an integer; "
+                f"got {raw_value!r} ({type(raw_value).__name__})"
+            )
         if value not in valid:
             raise ValueError(f"used_image_id {value} was not supplied")
         if value in result:
