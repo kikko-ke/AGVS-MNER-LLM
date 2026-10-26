@@ -88,6 +88,27 @@ def test_prompt_version_and_all_three_role_contracts() -> None:
     }
 
 
+def test_visual_review_normalizes_decimal_string_image_id() -> None:
+    review = payload(ROLE_VISUAL)
+    review["used_image_ids"] = ["0"]
+
+    result = validate_atomic_multirole_output(
+        review, typed_edit(), ROLE_VISUAL, {0}
+    )
+
+    assert result.used_image_ids == (0,)
+
+
+def test_visual_review_rejects_named_string_image_id() -> None:
+    review = payload(ROLE_VISUAL)
+    review["used_image_ids"] = ["image_0"]
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        validate_atomic_multirole_output(
+            review, typed_edit(), ROLE_VISUAL, {0}
+        )
+
+
 @pytest.mark.parametrize("field", ["confidence", "decisive_spans", "start", "end"])
 def test_rejects_self_reported_confidence_and_free_spans(field: str) -> None:
     value = 0.9 if field == "confidence" else [] if field == "decisive_spans" else 0

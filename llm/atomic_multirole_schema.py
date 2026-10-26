@@ -92,7 +92,15 @@ def _strict_image_ids(
 
     valid = set(valid_values)
     result: list[int] = []
-    for value in raw_image_ids:
+    for raw_value in raw_image_ids:
+        # Some OpenAI-compatible providers serialize a JSON integer as a
+        # decimal string even when the prompt shows an integer example. This
+        # repair is deliberately narrow: only an unsigned ASCII decimal is
+        # accepted, while names such as ``image_0`` and filenames remain
+        # invalid. The normalized cache contract still stores integers.
+        value = raw_value
+        if isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value):
+            value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("used_image_id must be an integer")
         if value not in valid:
