@@ -247,7 +247,9 @@ def test_visual_client_transmits_only_decodable_allowed_images(monkeypatch) -> N
     def fake_urlopen(request, timeout):
         del timeout
         requests.append(json.loads(request.data.decode("utf-8")))
-        return FakeResponse(json.dumps(payload(ROLE_VISUAL)))
+        response = payload(ROLE_VISUAL)
+        response["used_image_ids"] = ["visible.jpg"]
+        return FakeResponse(json.dumps(response))
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     client = LLMTeacherClient(
@@ -281,6 +283,39 @@ def test_visual_client_transmits_only_decodable_allowed_images(monkeypatch) -> N
     assert len(image_blocks) == 1
     assert "visible.jpg" in serialized
     assert "missing.jpg" not in serialized
+
+
+def test_visual_client_rejects_ambiguous_image_filename(monkeypatch) -> None:
+    def fake_urlopen(request, timeout):
+        del request, timeout
+        response = payload(ROLE_VISUAL)
+        response["used_image_ids"] = ["same.jpg"]
+        return FakeResponse(json.dumps(response))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = LLMTeacherClient(
+        base_url="https://example.invalid/v1",
+        api_key="secret",
+        model="teacher",
+        max_retries=0,
+    )
+    monkeypatch.setattr(
+        client,
+        "_prepare_images",
+        lambda paths: (
+            list(paths),
+            ["data:image/jpeg;base64,AAAA", "data:image/jpeg;base64,BBBB"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="got 'same.jpg'"):
+        client.complete_atomic_multirole_json(
+            WORDS,
+            [Path("first/same.jpg"), Path("second/same.jpg")],
+            EDIT,
+            ROLE_VISUAL,
+            valid_image_ids={0, 1},
+        )
 
 
 def test_client_requires_exactly_one_strict_edit_with_its_baseline() -> None:

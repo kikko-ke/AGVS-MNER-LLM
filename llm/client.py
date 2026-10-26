@@ -577,6 +577,16 @@ class LLMTeacherClient:
         elif not manifest:
             manifest = "[no decodable images]"
 
+        filename_to_ids: dict[str, list[int]] = {}
+        for index, path in enumerate(paths):
+            if index in decodable_ids and path is not None:
+                filename_to_ids.setdefault(path.name, []).append(index)
+        unique_filename_ids = {
+            filename: indices[0]
+            for filename, indices in filename_to_ids.items()
+            if len(indices) == 1
+        }
+
         user_text = build_atomic_multirole_user_prompt(
             words,
             typed_baseline,
@@ -586,8 +596,21 @@ class LLMTeacherClient:
         )
 
         def validate(payload: dict[str, Any]) -> AtomicMultiroleReview:
+            normalized_payload = dict(payload)
+            raw_image_ids = payload.get("used_image_ids")
+            if isinstance(raw_image_ids, list):
+                # The prompt exposes both a numeric slot and its basename. Some
+                # providers cite the exact basename instead of the slot. Map it
+                # only when it uniquely names an image that was actually sent;
+                # ambiguous, missing, and approximate names remain invalid.
+                normalized_payload["used_image_ids"] = [
+                    unique_filename_ids.get(value, value)
+                    if isinstance(value, str)
+                    else value
+                    for value in raw_image_ids
+                ]
             return validate_atomic_multirole_output(
-                payload,
+                normalized_payload,
                 typed_edit,
                 role,
                 decodable_ids,
