@@ -8,11 +8,16 @@ from torch import nn
 from modules.evidence_distillation import (
     EVIDENCE_EMBEDDING_SCHEMA_VERSION,
     build_evidence_distillation_targets,
+    evidence_adapter_distillation_loss,
     evidence_representation_distillation_loss,
     load_evidence_embedding_cache,
     sha256_file,
 )
 from modules.llm_dataset import TeacherCacheDataset
+from modules.trainer import (
+    freeze_for_evidence_adapter,
+    set_protected_evidence_adapter_train_mode,
+)
 
 
 class TinyTokenizer:
@@ -198,3 +203,59 @@ def test_evidence_loss_aligns_teacher_and_can_detach_text():
     aligned.backward()
     assert text.grad is None
     assert images.grad is not None
+
+
+def test_protected_adapter_loss_trains_inference_time_features():
+    features = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], requires_grad=True)
+    token_masks = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    teachers = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    weights = torch.tensor([[1.0, 1.0]])
+    projection = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        projection.weight.copy_(torch.eye(2))
+
+    loss = evidence_adapter_distillation_loss(
+        adapter_features=features,
+        teacher_embeddings=teachers,
+        token_masks=token_masks,
+        weights=weights,
+        student_projection=projection,
+        temperature=0.1,
+        contrastive_weight=0.1,
+    )
+    loss.backward()
+
+    assert loss >= 0
+    assert features.grad is not None
+    assert projection.weight.grad is not None
+
+
+class ProtectedToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = nn.Sequential(nn.Linear(2, 2), nn.Dropout(0.5))
+        self.evidence_adapter_down = nn.Linear(2, 2)
+        self.evidence_adapter_classifier = nn.Linear(2, 2)
+
+
+def test_protected_adapter_freezes_baseline_and_disables_its_dropout():
+    model = ProtectedToyModel()
+    trainable = freeze_for_evidence_adapter(model)
+    assert set(trainable) == {
+        "evidence_adapter_down.weight",
+        "evidence_adapter_down.bias",
+        "evidence_adapter_classifier.weight",
+        "evidence_adapter_classifier.bias",
+    }
+    assert not any(parameter.requires_grad for parameter in model.base.parameters())
+    assert all(
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name.startswith("evidence_adapter_")
+    )
+
+    model.train()
+    set_protected_evidence_adapter_train_mode(model)
+    assert model.base.training is False
+    assert model.evidence_adapter_down.training is True
+    assert model.evidence_adapter_classifier.training is True

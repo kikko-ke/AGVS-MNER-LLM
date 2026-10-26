@@ -1,6 +1,6 @@
-# 研究计划：训练期 LLM 证据表征蒸馏
+# 研究计划：受保护的训练期 LLM 证据适配
 
-## 当前主方法：V5 Evidence Representation Distillation
+## 当前主方法：V5.1 Protected Evidence Adapter
 
 V4 严格共识在冻结 pilot 上没有获得任何增益：基线 F1 `0.828393`，所选编辑
 oracle `0.854460`，严格共识只接受一个中性编辑并回到 `0.828393`；放宽共识
@@ -11,15 +11,20 @@ oracle `0.854460`，严格共识只接受一个中性编辑并回到 `0.828393`�
 
 `z_e = 1[span/type 与 gold 完全一致] * 1[confidence >= .90] * 1[evidence 非空] * 1[至少一个实际有效图片槽位]`
 
-冻结 BERT 将 LLM 解释编码为 `r_e`。学生将实体覆盖的 WordPiece 表征加权平均
-为 `t_e`，将教师指定图片的序列化 CLS 表征加权平均为 `v_e`，再通过小型
-投影头得到 `s_e = Proj([t_e;v_e])`。主目标为：
+V5.0 从强基线继续微调整个模型后，证据实验与无证据对照都从 `0.8179` 降到
+约 `0.814`，且 V5.0 未优于同轮对照。因此 V5.1 冻结全部既有基线参数，
+关闭其训练态 dropout，并加入零初始化的 token emission 残差适配器。适配器
+输入由冻结的文本状态与 AGVS 视觉上下文拼接得到，因而训练和推理输入一致。
+冻结 BERT 将 LLM 解释编码为 `r_e`，适配器实体表示为 `a_e`：
 
-`L = L_CRF + lambda_e * sum_e w_e (1 - cos(s_e, stopgrad(r_e)))`
+`emission = emission_base + AdapterClassifier(a)`
+
+`L = L_CRF + lambda_e * sum_e w_e (1 - cos(Proj(a_e), stopgrad(r_e))) + lambda_d ||delta||^2`
 
 可选的 batch 内对比项只作为消融，不在首轮 pilot 启用。首轮设
-`lambda_e=0.02`，阻断辅助损失进入 BERT、保留视觉路径梯度。解释向量和投影
-头只在训练中使用；部署仍是原始 AGVS 单次前向，不调用 LLM，不读取缓存。
+`lambda_e=0.02`、`lambda_d=0.01`，适配器宽度 128。LLM 解释向量只在训练中
+使用；部署保留小型适配器，但不调用 LLM、不读取缓存。配对的 adapter control
+使用完全相同结构和优化设置，仅令 `lambda_e=0`。
 
 当前数据审计：完整 grounding 缓存含 10,227 条记录；阈值 `.90` 后有 9,838
 个可用视觉实体，覆盖 7,094 个训练样本，类别为 MIS 1,358、LOC 1,357、ORG
@@ -28,7 +33,7 @@ oracle `0.854460`，严格共识只接受一个中性编辑并回到 `0.828393`�
 
 开发协议仍是 validation-only：从严格基线初始化，先记录 epoch 0，再与完全
 相同低学习率/epoch 的 continued-training 对照比较。单种子至少同时满足
-`V5 - epoch0 >= .003` 和 `V5 - continued >= .003` 才进入三种子确认；所有
+`V5.1 - epoch0 >= .003` 和 `V5.1 - adapter_control >= .003` 才进入三种子确认；所有
 设置冻结前不得查看 test。精确命令见 README。
 
 ## 历史 V4：单编辑、多角色共识

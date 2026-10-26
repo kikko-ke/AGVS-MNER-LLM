@@ -245,3 +245,60 @@ def evidence_representation_distillation_loss(
         / active_weights.sum().clamp_min(1e-12)
     )
     return cosine_loss + contrastive_weight * contrastive
+
+
+def evidence_adapter_distillation_loss(
+    *,
+    adapter_features: torch.Tensor,
+    teacher_embeddings: torch.Tensor,
+    token_masks: torch.Tensor,
+    weights: torch.Tensor,
+    student_projection: Callable[[torch.Tensor], torch.Tensor],
+    temperature: float,
+    contrastive_weight: float,
+) -> torch.Tensor:
+    """Align the inference-time residual adapter with frozen LLM rationales.
+
+    Unlike the legacy representation loss, this objective consumes the same
+    token-wise adapter states that are available at inference.  The teacher is
+    used only to supervise pooled gold entities during training.
+    """
+    if temperature <= 0:
+        raise ValueError("Evidence temperature must be positive")
+    if contrastive_weight < 0:
+        raise ValueError("Evidence contrastive weight must be non-negative")
+    if token_masks.shape[:2] != teacher_embeddings.shape[:2]:
+        raise ValueError("Evidence token masks and embeddings must share [B, E]")
+    if weights.shape != teacher_embeddings.shape[:2]:
+        raise ValueError("Evidence weights must have shape [B, E]")
+    if token_masks.shape[-1] != adapter_features.shape[1]:
+        raise ValueError("Evidence token masks must match adapter sequence length")
+
+    entity_features = torch.bmm(
+        token_masks.to(adapter_features.dtype),
+        adapter_features,
+    )
+    student = student_projection(entity_features)
+    active = weights.gt(0)
+    if not bool(active.any()):
+        return student.sum() * 0.0
+
+    student = F.normalize(student[active].float(), dim=-1)
+    teacher = F.normalize(teacher_embeddings[active].detach().float(), dim=-1)
+    active_weights = weights[active].float()
+    cosine_loss = ((1.0 - (student * teacher).sum(dim=-1)) * active_weights).sum()
+    cosine_loss = cosine_loss / active_weights.sum().clamp_min(1e-12)
+
+    if student.shape[0] <= 1 or contrastive_weight == 0:
+        return cosine_loss
+    logits = torch.matmul(student, teacher.transpose(0, 1)) / temperature
+    labels = torch.arange(student.shape[0], device=student.device)
+    student_to_teacher = F.cross_entropy(logits, labels, reduction="none")
+    teacher_to_student = F.cross_entropy(
+        logits.transpose(0, 1), labels, reduction="none"
+    )
+    contrastive = (
+        ((student_to_teacher + teacher_to_student) * 0.5 * active_weights).sum()
+        / active_weights.sum().clamp_min(1e-12)
+    )
+    return cosine_loss + contrastive_weight * contrastive

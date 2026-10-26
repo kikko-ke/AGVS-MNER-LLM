@@ -4,7 +4,10 @@ import torch.nn.functional as F
 from transformers import BertModel, ViTModel
 from torchcrf import CRF
 
-from modules.evidence_distillation import evidence_representation_distillation_loss
+from modules.evidence_distillation import (
+    evidence_adapter_distillation_loss,
+    evidence_representation_distillation_loss,
+)
 
 
 def _teacher_token_mask(
@@ -300,6 +303,15 @@ class AgvsMnerModel(nn.Module):
         self.llm_evidence_detach_image = getattr(
             args, "llm_evidence_detach_image", False
         )
+        self.llm_evidence_protected_adapter = getattr(
+            args, "llm_evidence_protected_adapter", False
+        )
+        self.llm_evidence_adapter_size = int(
+            getattr(args, "llm_evidence_adapter_size", 128)
+        )
+        self.llm_evidence_adapter_l2_weight = float(
+            getattr(args, "llm_evidence_adapter_l2_weight", 0.0)
+        )
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
@@ -425,6 +437,25 @@ class AgvsMnerModel(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(self.hidden_size),
             )
+            self.evidence_adapter_down = nn.Linear(
+                self.hidden_size * 2,
+                self.llm_evidence_adapter_size,
+            )
+            self.evidence_adapter_norm = nn.LayerNorm(
+                self.llm_evidence_adapter_size
+            )
+            self.evidence_adapter_rationale_proj = nn.Linear(
+                self.llm_evidence_adapter_size,
+                self.hidden_size,
+            )
+            self.evidence_adapter_classifier = nn.Linear(
+                self.llm_evidence_adapter_size,
+                self.num_labels,
+            )
+            # Exact epoch-zero equivalence: the randomly initialized hidden
+            # adapter cannot change CRF emissions until it receives gradients.
+            nn.init.zeros_(self.evidence_adapter_classifier.weight)
+            nn.init.zeros_(self.evidence_adapter_classifier.bias)
         finally:
             torch.set_rng_state(cpu_rng_state)
 
@@ -741,13 +772,18 @@ class AgvsMnerModel(nn.Module):
                 )
             visual_strength = visual_strength.reshape(batch_size, 1, 1)
             visual_strength = visual_strength.clamp(min=0.0, max=1.0)
-        if self.training and self.image_dropout_prob > 0:
+        if (
+            self.training
+            and not self.llm_evidence_protected_adapter
+            and self.image_dropout_prob > 0
+        ):
             keep_visual = (
                 torch.rand(batch_size, 1, 1, device=device) >= self.image_dropout_prob
             ).float()
             visual_strength = visual_strength * keep_visual
 
-        fused_text = text_seq + visual_strength * gate * cv
+        visual_token_context = visual_strength * gate * cv
+        fused_text = text_seq + visual_token_context
         fused_text = self.layer_norm(fused_text)
         fused_text = self.output_dropout(fused_text)
 
@@ -756,6 +792,25 @@ class AgvsMnerModel(nn.Module):
         # -----------------------------
         fused_text = fused_text * attention_mask.unsqueeze(-1).float()
         emissions = self.fc(fused_text)
+        evidence_adapter_features = None
+        evidence_adapter_delta = None
+        if self.llm_evidence_protected_adapter:
+            # The baseline is frozen in protected mode.  Detaching its states
+            # makes the separation explicit and reduces autograd memory.
+            adapter_input = torch.cat(
+                [text_seq.detach(), visual_token_context.detach()], dim=-1
+            )
+            evidence_adapter_features = self.evidence_adapter_norm(
+                F.gelu(self.evidence_adapter_down(adapter_input))
+            )
+            evidence_adapter_delta = self.evidence_adapter_classifier(
+                evidence_adapter_features
+            )
+            evidence_adapter_delta = (
+                evidence_adapter_delta
+                * attention_mask.unsqueeze(-1).to(evidence_adapter_delta.dtype)
+            )
+            emissions = emissions + evidence_adapter_delta
 
         if labels is not None:
             ner_loss = -self.crf(
@@ -766,6 +821,24 @@ class AgvsMnerModel(nn.Module):
             )
             total_loss = ner_loss
             loss_components = {"ner": ner_loss.detach()}
+            if evidence_adapter_delta is not None:
+                valid_delta = evidence_adapter_delta * attention_mask.unsqueeze(
+                    -1
+                ).to(evidence_adapter_delta.dtype)
+                delta_square = valid_delta.float().square().sum()
+                delta_count = (
+                    attention_mask.float().sum() * evidence_adapter_delta.shape[-1]
+                ).clamp_min(1.0)
+                adapter_l2 = delta_square / delta_count
+                if self.llm_evidence_adapter_l2_weight > 0:
+                    total_loss = (
+                        total_loss
+                        + self.llm_evidence_adapter_l2_weight * adapter_l2
+                    )
+                loss_components["evidence_adapter_delta_rms"] = (
+                    adapter_l2.detach().sqrt()
+                )
+                loss_components["evidence_adapter_l2"] = adapter_l2.detach()
 
             if llm_token_probs is not None and self.llm_token_loss_weight > 0:
                 teacher_probs = llm_token_probs.to(emissions.device).clamp_min(1e-6)
@@ -837,21 +910,35 @@ class AgvsMnerModel(nn.Module):
                 and llm_evidence_weights is not None
                 and self.llm_evidence_loss_weight > 0
             ):
-                evidence_loss = evidence_representation_distillation_loss(
-                    text_features=text_seq,
-                    image_features=cls_tokens,
-                    teacher_embeddings=llm_evidence_embeddings,
-                    token_masks=llm_evidence_token_masks,
-                    image_targets=llm_evidence_image_targets,
-                    weights=llm_evidence_weights,
-                    student_projection=self.evidence_student_proj,
-                    temperature=float(self.llm_evidence_temperature),
-                    contrastive_weight=float(
-                        self.llm_evidence_contrastive_weight
-                    ),
-                    detach_text=bool(self.llm_evidence_detach_text),
-                    detach_image=bool(self.llm_evidence_detach_image),
-                )
+                if self.llm_evidence_protected_adapter:
+                    assert evidence_adapter_features is not None
+                    evidence_loss = evidence_adapter_distillation_loss(
+                        adapter_features=evidence_adapter_features,
+                        teacher_embeddings=llm_evidence_embeddings,
+                        token_masks=llm_evidence_token_masks,
+                        weights=llm_evidence_weights,
+                        student_projection=self.evidence_adapter_rationale_proj,
+                        temperature=float(self.llm_evidence_temperature),
+                        contrastive_weight=float(
+                            self.llm_evidence_contrastive_weight
+                        ),
+                    )
+                else:
+                    evidence_loss = evidence_representation_distillation_loss(
+                        text_features=text_seq,
+                        image_features=cls_tokens,
+                        teacher_embeddings=llm_evidence_embeddings,
+                        token_masks=llm_evidence_token_masks,
+                        image_targets=llm_evidence_image_targets,
+                        weights=llm_evidence_weights,
+                        student_projection=self.evidence_student_proj,
+                        temperature=float(self.llm_evidence_temperature),
+                        contrastive_weight=float(
+                            self.llm_evidence_contrastive_weight
+                        ),
+                        detach_text=bool(self.llm_evidence_detach_text),
+                        detach_image=bool(self.llm_evidence_detach_image),
+                    )
                 total_loss = total_loss + self.llm_evidence_loss_weight * evidence_loss
                 loss_components["llm_evidence_representation"] = evidence_loss.detach()
 

@@ -2,7 +2,7 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前主线：V5 训练期 LLM 证据表征蒸馏
+## 当前主线：V5.1 受保护的 LLM 证据残差适配器
 
 V4 严格共识已经判定为 **no-go**：其开发集基线 F1 为 `0.828393`，所选
 原子编辑 oracle 为 `0.854460`，但三角色严格共识只接受 1 个中性编辑，最终
@@ -15,11 +15,13 @@ V5 复用已经生成的完整 grounding 缓存。只接受同时满足以下条
 2. `confidence >= 0.90`；
 3. `evidence` 非空，且至少引用一张当前可解码的有效图片。
 
-离线脚本用冻结的 BERT 编码 LLM 生成的视觉证据解释。训练时，学生从实体
-WordPiece 表征和 LLM 指定图片的 CLS 表征构造联合向量，并用余弦损失（可选
-小权重对比损失）对齐冻结的解释向量。默认阻断该辅助损失进入文本 BERT，
-只让它更新小型投影头与视觉路径。推理、validation 和 test 都不读取解释、
-LLM 或教师缓存，不增加推理 API、延迟或输入泄漏。
+V5.0 直接继续微调整个基线时，证据模型与无证据对照都从 epoch-0 的
+`0.8179` 降到约 `0.814`，说明主要问题是强基线的继续训练过拟合；V5.0 相对
+同轮对照也没有正增益。V5.1 因此冻结 BERT、ViT、原 AGVS 融合、NER 分类器
+和 CRF，并加入零初始化的残差适配器。适配器读取部署时同样可得的文本表示与
+AGVS 视觉上下文；LLM 解释只对该适配器的实体表示提供训练监督。零初始化保证
+epoch 0 与基线逐值一致，冻结主干阻止基线漂移。推理、validation 和 test 都
+不读取解释、LLM 或教师缓存，不增加推理 API。
 
 当前缓存审计得到 `9,838` 个可用实体、覆盖 `7,094` 个训练样本；解释文本
 重复率约 `0.5%`。预计算产物同时记录训练文件与 grounding 缓存 SHA-256，
@@ -69,15 +71,15 @@ python -u run_llm.py \
   --teacher-cache teacher_cache/siliconflow_qwen3vl32b_grounding \
   --teacher-cache-task grounding \
   --llm-evidence-embedding-cache "$EVIDENCE" \
-  --output-dir outputs_llm/v5_evidence_cosine_w002_seed1234 \
+  --output-dir outputs_llm/v51_protected_evidence_w002_seed1234 \
   --init-checkpoint "$BASELINE" \
   --device cuda \
   --num-epochs 5 \
   --batch-size 4 \
   --num-workers 4 \
-  --lr 1e-5 \
-  --bert-lr 2e-6 \
-  --vit-lr 1e-6 \
+  --lr 1e-4 \
+  --bert-lr 0 \
+  --vit-lr 0 \
   --warmup-ratio 0.01 \
   --weight-decay 0.01 \
   --patience 3 \
@@ -93,16 +95,17 @@ python -u run_llm.py \
   --llm-evidence-loss-weight 0.02 \
   --llm-evidence-contrastive-weight 0 \
   --llm-evidence-max-entities 8 \
-  --llm-evidence-detach-text \
-  --no-llm-evidence-detach-image \
+  --llm-evidence-protected-adapter \
+  --llm-evidence-adapter-size 128 \
+  --llm-evidence-adapter-l2-weight 0.01 \
   --skip-test \
-  2>&1 | tee logs/train_v5_evidence_cosine_w002_seed1234.log
+  2>&1 | tee logs/train_v51_protected_evidence_w002_seed1234.log
 ```
 
-首轮判据：epoch 0 必须复现基线；最佳 validation F1 至少比 epoch 0 高
-`0.003`，并且优于相同学习率/epoch 的无 V5 continued-training 对照至少
-`0.003`。不满足就停止，不能用 test 继续调参。满足后再冻结配置，运行
-`42、1234、2026` 三个种子。
+必须再运行同结构的 adapter control：保留 `--llm-evidence-protected-adapter`，
+把 `--llm-evidence-loss-weight` 改为 0，并移除 embedding-cache 参数。首轮判据
+是 epoch 0 复现基线；V5.1 最佳 validation F1 至少比 epoch 0 和 adapter
+control 各高 `0.003`。不满足就停止，不能用 test 继续调参。
 
 ## 历史 V4：单编辑、多角色保守共识
 

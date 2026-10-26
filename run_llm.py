@@ -17,7 +17,7 @@ from models.agvs_mner import AgvsMnerModel
 from modules.dataset import MultimodalNerDataset
 from modules.llm_dataset import TeacherCacheDataset
 from modules.llm_trainer import LlmNerTrainer
-from modules.trainer import load_compatible_model_checkpoint
+from modules.trainer import freeze_for_evidence_adapter, load_compatible_model_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,6 +144,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--llm-evidence-max-entities", type=int, default=8)
     parser.add_argument(
+        "--llm-evidence-protected-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze the loaded AGVS baseline and train a zero-init residual adapter",
+    )
+    parser.add_argument("--llm-evidence-adapter-size", type=int, default=128)
+    parser.add_argument(
+        "--llm-evidence-adapter-l2-weight", type=float, default=0.01
+    )
+    parser.add_argument(
         "--llm-evidence-detach-text",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -214,6 +224,33 @@ def main() -> None:
         raise ValueError("--llm-evidence-contrastive-weight must be non-negative")
     if args.llm_evidence_max_entities <= 0:
         raise ValueError("--llm-evidence-max-entities must be positive")
+    if args.llm_evidence_adapter_size <= 0:
+        raise ValueError("--llm-evidence-adapter-size must be positive")
+    if args.llm_evidence_adapter_l2_weight < 0:
+        raise ValueError("--llm-evidence-adapter-l2-weight must be non-negative")
+    if args.llm_evidence_protected_adapter and not args.init_checkpoint:
+        raise ValueError(
+            "--llm-evidence-protected-adapter requires --init-checkpoint"
+        )
+    if args.llm_evidence_protected_adapter:
+        adapter_conflicts = {
+            "llm_token_loss_weight": args.llm_token_loss_weight,
+            "llm_image_loss_weight": args.llm_image_loss_weight,
+            "llm_grounding_loss_weight": args.llm_grounding_loss_weight,
+            "llm_routed_crf_loss_weight": args.llm_routed_crf_loss_weight,
+            "llm_consistency_kl_weight": args.llm_consistency_kl_weight,
+        }
+        active_adapter_conflicts = [
+            name
+            for name, value in adapter_conflicts.items()
+            if float(value) > 0
+        ]
+        if active_adapter_conflicts or args.llm_utility_gate:
+            raise ValueError(
+                "Isolate the protected evidence adapter from earlier LLM paths; "
+                f"active conflicts={active_adapter_conflicts}, "
+                f"utility_gate={args.llm_utility_gate}"
+            )
     evidence_distillation_enabled = args.llm_evidence_loss_weight > 0
     if evidence_distillation_enabled:
         if args.teacher_cache_task != "grounding":
@@ -353,6 +390,19 @@ def main() -> None:
             "Initialized from %s; retained initialization for optional keys: %s",
             args.init_checkpoint,
             missing_keys or "none",
+        )
+    if args.llm_evidence_protected_adapter:
+        trainable = freeze_for_evidence_adapter(model)
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        logging.getLogger(__name__).info(
+            "Protected V5.1 adapter: %d trainable tensors, %d parameters; "
+            "all baseline parameters frozen",
+            len(trainable),
+            trainable_count,
         )
     trainer = LlmNerTrainer(
         train_loader,

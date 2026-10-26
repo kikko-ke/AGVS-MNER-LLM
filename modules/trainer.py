@@ -29,6 +29,7 @@ _AUXILIARY_GROUNDING_PARAMETERS = (
     "grounding_none",
     "grounding_fusion_proj.",
     "evidence_student_proj.",
+    "evidence_adapter_",
 )
 
 _OPTIONAL_TEACHER_HEAD_PARAMETERS = (
@@ -39,7 +40,29 @@ _OPTIONAL_TEACHER_HEAD_PARAMETERS = (
     "grounding_fusion_scale",
     "utility_gate_scale",
     "evidence_student_proj.",
+    "evidence_adapter_",
 )
+
+_EVIDENCE_ADAPTER_PARAMETER_PREFIX = "evidence_adapter_"
+
+
+def freeze_for_evidence_adapter(model: torch.nn.Module) -> list[str]:
+    """Freeze the loaded baseline and leave only the V5.1 adapter trainable."""
+    trainable = []
+    for name, parameter in model.named_parameters():
+        enabled = name.startswith(_EVIDENCE_ADAPTER_PARAMETER_PREFIX)
+        parameter.requires_grad = enabled
+        if enabled:
+            trainable.append(name)
+    if not trainable:
+        raise ValueError("Protected evidence adapter parameters were not found")
+    return trainable
+
+
+def set_protected_evidence_adapter_train_mode(model: torch.nn.Module) -> None:
+    """Keep frozen baseline dropout disabled while training adapter modules."""
+    for name, module in model.named_children():
+        module.train(name.startswith(_EVIDENCE_ADAPTER_PARAMETER_PREFIX))
 
 
 def load_compatible_model_checkpoint(
@@ -240,6 +263,10 @@ class NerTrainer:
     ) -> dict[str, Any]:
         if training:
             self.model.train()
+            if bool(
+                getattr(self.args, "llm_evidence_protected_adapter", False)
+            ):
+                set_protected_evidence_adapter_train_mode(self.model)
         else:
             self.model.eval()
 
