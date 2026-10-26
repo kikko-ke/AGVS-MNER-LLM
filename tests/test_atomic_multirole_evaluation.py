@@ -246,6 +246,21 @@ def test_consensus_applies_at_most_one_supported_edit_and_reports_metrics(
     assert result["consensus"]["harmful"] == 0
     assert result["consensus"]["top1_exact_preservation"] == 1.0
     assert result["role_diagnostics"]["valid_response_coverage"] == 1.0
+    diagnostics = result["exploratory_outcome_diagnostics"]
+    assert diagnostics["role_verdict_outcomes"]["visual_verifier"][
+        "SUPPORT_EDIT"
+    ] == {
+        "total": 2,
+        "beneficial": 1,
+        "neutral": 0,
+        "harmful": 1,
+        "beneficial_precision": 0.5,
+        "harmful_rate": 0.5,
+    }
+    assert diagnostics["diagnostic_policies"]["text_support_edit"][
+        "beneficial"
+    ] == 1
+    assert diagnostics["diagnostic_policies"]["text_support_edit"]["harmful"] == 0
     assert result["go_no_go"]["passed"] is False  # accepted < locked minimum 20
 
 

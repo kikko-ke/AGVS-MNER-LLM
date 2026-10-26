@@ -13,7 +13,7 @@ import ast
 import json
 import math
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -517,11 +517,21 @@ def evaluate_pilot(
         valid_reviews.setdefault(pair, {})[reviewer_role] = validated.to_dict()
 
     patterns: Counter[str] = Counter()
+    pattern_outcomes: dict[str, Counter[str]] = defaultdict(Counter)
+    role_verdict_outcomes: dict[str, dict[str, Counter[str]]] = {
+        role: defaultdict(Counter) for role in REQUIRED_REVIEWER_ROLES
+    }
+    outcome_by_pair = {
+        (int(row["sample_id"]), str(row["edit_id"])): str(row["outcome"])
+        for row in selected_rows
+    }
+    role_maps_by_pair: dict[tuple[int, str], dict[str, dict[str, Any]]] = {}
     role_valid = Counter[str]()
     complete = 0
     consensus_ids: set[tuple[int, str]] = set()
     for pair in sorted(selected_keys):
         role_map = valid_reviews.get(pair, {})
+        role_maps_by_pair[pair] = role_map
         for reviewer_role in REQUIRED_REVIEWER_ROLES:
             if reviewer_role in role_map:
                 role_valid[reviewer_role] += 1
@@ -532,6 +542,11 @@ def evaluate_pilot(
             for reviewer_role in REQUIRED_REVIEWER_ROLES
         )
         patterns[pattern] += 1
+        outcome = outcome_by_pair[pair]
+        pattern_outcomes[pattern][outcome] += 1
+        for reviewer_role in REQUIRED_REVIEWER_ROLES:
+            verdict = role_map.get(reviewer_role, {}).get("verdict", "MISSING")
+            role_verdict_outcomes[reviewer_role][str(verdict)][outcome] += 1
         if _consensus(role_map):
             consensus_ids.add(pair)
 
@@ -559,6 +574,84 @@ def evaluate_pilot(
     consensus["normalized_oracle_gain"] = (
         consensus["gain_over_top1"] / oracle_gain if oracle_gain > 1e-12 else 0.0
     )
+
+    def _verdict(pair: tuple[int, str], role: str) -> str:
+        return str(
+            role_maps_by_pair.get(pair, {}).get(role, {}).get("verdict", "MISSING")
+        )
+
+    diagnostic_rule_ids = {
+        "text_support_edit": {
+            pair for pair in selected_keys if _verdict(pair, ROLE_TEXT) == "SUPPORT_EDIT"
+        },
+        "visual_support_edit": {
+            pair
+            for pair in selected_keys
+            if _verdict(pair, ROLE_VISUAL) == "SUPPORT_EDIT"
+        },
+        "critic_no_objection": {
+            pair
+            for pair in selected_keys
+            if _verdict(pair, ROLE_CRITIC) == "NO_OBJECTION"
+        },
+        "any_verifier_support_no_verifier_rejection_ignore_critic": {
+            pair
+            for pair in selected_keys
+            if "SUPPORT_EDIT"
+            in {_verdict(pair, ROLE_TEXT), _verdict(pair, ROLE_VISUAL)}
+            and "SUPPORT_BASELINE"
+            not in {_verdict(pair, ROLE_TEXT), _verdict(pair, ROLE_VISUAL)}
+        },
+        "both_verifiers_support_edit_ignore_critic": {
+            pair
+            for pair in selected_keys
+            if _verdict(pair, ROLE_TEXT) == "SUPPORT_EDIT"
+            and _verdict(pair, ROLE_VISUAL) == "SUPPORT_EDIT"
+        },
+    }
+    diagnostic_policies: dict[str, dict[str, Any]] = {}
+    for name, accepted_ids in diagnostic_rule_ids.items():
+        metrics = _metrics(
+            baseline_counts,
+            baseline_exact_by_role[meta_role],
+            selected_rows,
+            accepted_ids,
+        )
+        metrics["gain_over_top1"] = float(metrics["f1"] - baseline_f1)
+        metrics["normalized_oracle_gain"] = (
+            metrics["gain_over_top1"] / oracle_gain if oracle_gain > 1e-12 else 0.0
+        )
+        diagnostic_policies[name] = metrics
+
+    def _counter_summary(counter: Counter[str]) -> dict[str, Any]:
+        total = sum(counter.values())
+        return {
+            "total": total,
+            "beneficial": counter["beneficial"],
+            "neutral": counter["neutral"],
+            "harmful": counter["harmful"],
+            "beneficial_precision": counter["beneficial"] / total if total else 0.0,
+            "harmful_rate": counter["harmful"] / total if total else 0.0,
+        }
+
+    exploratory_outcome_diagnostics = {
+        "selection_warning": (
+            "Exploratory meta_calibration attribution only; any revised rule selected "
+            "from these labels requires a new independent holdout."
+        ),
+        "pattern_outcomes": {
+            pattern: _counter_summary(counts)
+            for pattern, counts in sorted(pattern_outcomes.items())
+        },
+        "role_verdict_outcomes": {
+            role: {
+                verdict: _counter_summary(counts)
+                for verdict, counts in sorted(verdicts.items())
+            }
+            for role, verdicts in role_verdict_outcomes.items()
+        },
+        "diagnostic_policies": diagnostic_policies,
+    }
     selected_count = len(selected_rows)
     valid_response_coverage = complete / selected_count if selected_count else 0.0
     role_diagnostics = {
@@ -624,6 +717,7 @@ def evaluate_pilot(
         "selected_edit_oracle": oracle,
         "consensus": consensus,
         "role_diagnostics": role_diagnostics,
+        "exploratory_outcome_diagnostics": exploratory_outcome_diagnostics,
         "go_no_go": {
             "thresholds": dict(GO_NO_GO_THRESHOLDS),
             "checks": checks,
