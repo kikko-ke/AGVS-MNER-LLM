@@ -18,6 +18,16 @@ from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 from PIL import Image, UnidentifiedImageError
 
+from llm.augmentation_prompts import (
+    AUGMENTATION_SYSTEM_PROMPT,
+    build_augmentation_user_prompt,
+)
+from llm.augmentation_schema import (
+    AUGMENTATION_PROMPT_VERSION,
+    AugmentationResponse,
+    ProtectedEntity,
+    validate_augmentation_output,
+)
 from llm.atomic_multirole_schema import (
     ATOMIC_MULTIROLE_PROMPT_VERSION,
     AtomicMultiroleReview,
@@ -306,6 +316,62 @@ class LLMTeacherClient:
             prepared_images,
             validator=validator,
         )
+
+    def complete_augmentation_json(
+        self,
+        words: Sequence[str],
+        image_paths: Iterable[Path | None],
+        protected_entities: Sequence[ProtectedEntity],
+        *,
+        min_context_change_ratio: float = 0.15,
+        max_context_change_ratio: float = 0.85,
+        min_length_ratio: float = 0.60,
+        max_length_ratio: float = 1.50,
+        max_words: int = 96,
+        accepted_validator: Callable[[AugmentationResponse], None] | None = None,
+        prompt_version: str = AUGMENTATION_PROMPT_VERSION,
+    ) -> AugmentationResponse:
+        """Create one validated image-grounded, entity-preserving rewrite."""
+        if prompt_version != AUGMENTATION_PROMPT_VERSION:
+            raise ValueError("unsupported augmentation prompt_version")
+        words = [str(word) for word in words]
+        paths, prepared_images = self._prepare_images(image_paths)
+        valid_image_ids = {
+            index
+            for index, data_url in enumerate(prepared_images)
+            if data_url is not None
+        }
+        user_text = build_augmentation_user_prompt(
+            words,
+            protected_entities,
+            paths,
+            valid_image_ids,
+        )
+
+        def validate(payload: dict[str, Any]) -> AugmentationResponse:
+            response = validate_augmentation_output(
+                payload,
+                words,
+                protected_entities,
+                valid_image_ids,
+                min_context_change_ratio=min_context_change_ratio,
+                max_context_change_ratio=max_context_change_ratio,
+                min_length_ratio=min_length_ratio,
+                max_length_ratio=max_length_ratio,
+                max_words=max_words,
+            )
+            if not response.abstain and accepted_validator is not None:
+                accepted_validator(response)
+            return response
+
+        result = self._complete_prepared_json(
+            f"{AUGMENTATION_SYSTEM_PROMPT}\nProtocol version: {prompt_version}.",
+            user_text,
+            prepared_images,
+            validator=validate,
+        )
+        assert isinstance(result, AugmentationResponse)
+        return result
 
     def complete_json(
         self,
