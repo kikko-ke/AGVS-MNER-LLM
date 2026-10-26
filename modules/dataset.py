@@ -117,6 +117,7 @@ class MultimodalNerDataset(Dataset[tuple[torch.Tensor, ...]]):
     def __init__(self, args: Any, file_name: str) -> None:
         self.max_sequence_length = args.max_seq_length
         self.processor = MnerProcessor(args)
+        self.source_path = self.processor.data_path / file_name
         self.image_processor = ViTImageProcessor.from_pretrained(args.vit_model)
         self.examples = self.processor.load_examples(file_name)
         self.tokenizer = self.processor.tokenizer

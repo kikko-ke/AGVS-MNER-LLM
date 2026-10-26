@@ -133,6 +133,29 @@ def parse_args() -> argparse.Namespace:
         help="Temperature for routed-to-full token-emission consistency",
     )
     parser.add_argument(
+        "--llm-evidence-embedding-cache",
+        default=None,
+        help="Precomputed grounding-rationale embeddings used only during training",
+    )
+    parser.add_argument("--llm-evidence-loss-weight", type=float, default=0.0)
+    parser.add_argument("--llm-evidence-temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--llm-evidence-contrastive-weight", type=float, default=0.1
+    )
+    parser.add_argument("--llm-evidence-max-entities", type=int, default=8)
+    parser.add_argument(
+        "--llm-evidence-detach-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep rationale alignment gradients out of the shared BERT encoder",
+    )
+    parser.add_argument(
+        "--llm-evidence-detach-image",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Detach ViT/image-sequence features from rationale alignment",
+    )
+    parser.add_argument(
         "--init-checkpoint",
         default=None,
         help="Optional baseline checkpoint used to initialize compatible model parameters",
@@ -183,6 +206,39 @@ def main() -> None:
         raise ValueError("--llm-consistency-kl-weight must be non-negative")
     if args.llm_consistency_temperature <= 0:
         raise ValueError("--llm-consistency-temperature must be positive")
+    if args.llm_evidence_loss_weight < 0:
+        raise ValueError("--llm-evidence-loss-weight must be non-negative")
+    if args.llm_evidence_temperature <= 0:
+        raise ValueError("--llm-evidence-temperature must be positive")
+    if args.llm_evidence_contrastive_weight < 0:
+        raise ValueError("--llm-evidence-contrastive-weight must be non-negative")
+    if args.llm_evidence_max_entities <= 0:
+        raise ValueError("--llm-evidence-max-entities must be positive")
+    evidence_distillation_enabled = args.llm_evidence_loss_weight > 0
+    if evidence_distillation_enabled:
+        if args.teacher_cache_task != "grounding":
+            raise ValueError(
+                "Evidence representation distillation requires a grounding cache"
+            )
+        if not args.llm_evidence_embedding_cache:
+            raise ValueError(
+                "--llm-evidence-embedding-cache is required when evidence loss is enabled"
+            )
+        conflicting_weights = {
+            "llm_token_loss_weight": args.llm_token_loss_weight,
+            "llm_image_loss_weight": args.llm_image_loss_weight,
+            "llm_grounding_loss_weight": args.llm_grounding_loss_weight,
+            "llm_routed_crf_loss_weight": args.llm_routed_crf_loss_weight,
+            "llm_consistency_kl_weight": args.llm_consistency_kl_weight,
+        }
+        active_conflicts = [
+            name for name, value in conflicting_weights.items() if float(value) > 0
+        ]
+        if active_conflicts or args.llm_utility_gate:
+            raise ValueError(
+                "Isolate evidence representation distillation from earlier LLM losses; "
+                f"active conflicts={active_conflicts}, utility_gate={args.llm_utility_gate}"
+            )
     evidence_intervention_enabled = (
         args.llm_routed_crf_loss_weight > 0
         or args.llm_consistency_kl_weight > 0
@@ -225,18 +281,32 @@ def main() -> None:
         enable_grounding=(
             args.llm_grounding_loss_weight > 0 or evidence_intervention_enabled
         ),
+        enable_evidence_distillation=evidence_distillation_enabled,
+        evidence_embedding_path=(
+            args.llm_evidence_embedding_cache
+            if evidence_distillation_enabled
+            else None
+        ),
+        evidence_max_entities=args.llm_evidence_max_entities,
     )
+    evidence_embedding_dim = train_data.evidence_embedding_dim
     dev_data = TeacherCacheDataset(
         dev_base,
         cache_dir / f"MNER-{args.dataset}_val.jsonl",
         grounding_confidence_threshold=args.llm_grounding_confidence,
         enable_grounding=False,
+        enable_evidence_distillation=evidence_distillation_enabled,
+        evidence_max_entities=args.llm_evidence_max_entities,
+        evidence_embedding_dim=evidence_embedding_dim,
     )
     test_data = TeacherCacheDataset(
         test_base,
         cache_dir / f"MNER-{args.dataset}_test.jsonl",
         grounding_confidence_threshold=args.llm_grounding_confidence,
         enable_grounding=False,
+        enable_evidence_distillation=evidence_distillation_enabled,
+        evidence_max_entities=args.llm_evidence_max_entities,
+        evidence_embedding_dim=evidence_embedding_dim,
     )
 
     if args.llm_grounding_loss_weight > 0 or evidence_intervention_enabled:
@@ -253,6 +323,17 @@ def main() -> None:
             raise ValueError(
                 "Grounding loss is enabled but no teacher entity passed the cache task, "
                 "gold-consistency, confidence, and image-evidence checks"
+            )
+
+    if evidence_distillation_enabled:
+        summary = train_data.evidence_distillation_summary()
+        logging.getLogger(__name__).info(
+            "LLM evidence representation supervision: %s",
+            json.dumps(summary, ensure_ascii=False),
+        )
+        if summary["artifact_entities"] == 0:
+            raise ValueError(
+                "Evidence representation loss is enabled but the artifact is empty"
             )
 
     loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}

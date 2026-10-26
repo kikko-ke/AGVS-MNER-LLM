@@ -28,6 +28,7 @@ _AUXILIARY_GROUNDING_PARAMETERS = (
     "grounding_image_proj.",
     "grounding_none",
     "grounding_fusion_proj.",
+    "evidence_student_proj.",
 )
 
 _OPTIONAL_TEACHER_HEAD_PARAMETERS = (
@@ -37,6 +38,7 @@ _OPTIONAL_TEACHER_HEAD_PARAMETERS = (
     "grounding_fusion_proj.",
     "grounding_fusion_scale",
     "utility_gate_scale",
+    "evidence_student_proj.",
 )
 
 

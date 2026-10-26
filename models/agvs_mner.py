@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from transformers import BertModel, ViTModel
 from torchcrf import CRF
 
+from modules.evidence_distillation import evidence_representation_distillation_loss
+
 
 def _teacher_token_mask(
     attention_mask: torch.Tensor,
@@ -287,6 +289,17 @@ class AgvsMnerModel(nn.Module):
         self.llm_grounding_detach_backbone = getattr(
             args, "llm_grounding_detach_backbone", True
         )
+        self.llm_evidence_loss_weight = getattr(args, "llm_evidence_loss_weight", 0.0)
+        self.llm_evidence_temperature = getattr(args, "llm_evidence_temperature", 0.1)
+        self.llm_evidence_contrastive_weight = getattr(
+            args, "llm_evidence_contrastive_weight", 0.1
+        )
+        self.llm_evidence_detach_text = getattr(
+            args, "llm_evidence_detach_text", True
+        )
+        self.llm_evidence_detach_image = getattr(
+            args, "llm_evidence_detach_image", False
+        )
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
 
         # Text encoder
@@ -407,6 +420,11 @@ class AgvsMnerModel(nn.Module):
             self.utility_gate_scale = nn.Parameter(
                 torch.tensor(float(getattr(args, "llm_utility_gate_init", 0.0)))
             )
+            self.evidence_student_proj = nn.Sequential(
+                nn.Linear(self.hidden_size * 2, self.hidden_size),
+                nn.GELU(),
+                nn.LayerNorm(self.hidden_size),
+            )
         finally:
             torch.set_rng_state(cpu_rng_state)
 
@@ -429,6 +447,10 @@ class AgvsMnerModel(nn.Module):
         llm_available=None,
         llm_grounding_targets=None,
         llm_grounding_weights=None,
+        llm_evidence_token_masks=None,
+        llm_evidence_image_targets=None,
+        llm_evidence_embeddings=None,
+        llm_evidence_weights=None,
         return_features=False
     ):
         if image_pixel_values is None:
@@ -807,6 +829,31 @@ class AgvsMnerModel(nn.Module):
                     + self.llm_grounding_loss_weight * grounding_loss
                 )
                 loss_components["entity_image_grounding"] = grounding_loss.detach()
+
+            if (
+                llm_evidence_token_masks is not None
+                and llm_evidence_image_targets is not None
+                and llm_evidence_embeddings is not None
+                and llm_evidence_weights is not None
+                and self.llm_evidence_loss_weight > 0
+            ):
+                evidence_loss = evidence_representation_distillation_loss(
+                    text_features=text_seq,
+                    image_features=cls_tokens,
+                    teacher_embeddings=llm_evidence_embeddings,
+                    token_masks=llm_evidence_token_masks,
+                    image_targets=llm_evidence_image_targets,
+                    weights=llm_evidence_weights,
+                    student_projection=self.evidence_student_proj,
+                    temperature=float(self.llm_evidence_temperature),
+                    contrastive_weight=float(
+                        self.llm_evidence_contrastive_weight
+                    ),
+                    detach_text=bool(self.llm_evidence_detach_text),
+                    detach_image=bool(self.llm_evidence_detach_image),
+                )
+                total_loss = total_loss + self.llm_evidence_loss_weight * evidence_loss
+                loss_components["llm_evidence_representation"] = evidence_loss.detach()
 
             self.last_loss_components = loss_components
 

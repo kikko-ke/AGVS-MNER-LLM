@@ -11,6 +11,11 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from modules.evidence_distillation import (
+    build_evidence_distillation_targets,
+    load_evidence_embedding_cache,
+    sha256_file,
+)
 from modules.text_utils import normalize_unicode_text
 
 
@@ -210,6 +215,10 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         balance_grounding_classes: bool = False,
         grounding_background_ratio: float = 0.0,
         visual_utility_threshold: float = 0.5,
+        enable_evidence_distillation: bool = False,
+        evidence_embedding_path: str | Path | None = None,
+        evidence_max_entities: int = 8,
+        evidence_embedding_dim: int = 768,
     ) -> None:
         self.base_dataset = base_dataset
         self.cache_path = Path(cache_path)
@@ -218,6 +227,39 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
         self.expected_teacher_task = expected_teacher_task
         self.grounding_background_ratio = grounding_background_ratio
         self.visual_utility_threshold = visual_utility_threshold
+        self.enable_evidence_distillation = enable_evidence_distillation
+        self.evidence_max_entities = int(evidence_max_entities)
+        self.evidence_embedding_dim = int(evidence_embedding_dim)
+        if self.evidence_max_entities <= 0:
+            raise ValueError("evidence_max_entities must be positive")
+        if self.evidence_embedding_dim <= 0:
+            raise ValueError("evidence_embedding_dim must be positive")
+        self.evidence_rows_by_sample: dict[int, list[int]] = {}
+        self.evidence_artifact: dict[str, Any] | None = None
+        if evidence_embedding_path is not None:
+            evidence_index, artifact = load_evidence_embedding_cache(
+                evidence_embedding_path
+            )
+            actual_cache_hash = sha256_file(self.cache_path)
+            if artifact["teacher_cache_sha256"] != actual_cache_hash:
+                raise ValueError(
+                    "Evidence artifact teacher-cache hash does not match the active cache"
+                )
+            source_path = getattr(self.base_dataset, "source_path", None)
+            if source_path is not None:
+                actual_input_hash = sha256_file(source_path)
+                if artifact["input_sha256"] != actual_input_hash:
+                    raise ValueError(
+                        "Evidence artifact input hash does not match the active dataset"
+                    )
+            artifact_dim = int(artifact["embeddings"].shape[1])
+            if artifact_dim != self.evidence_embedding_dim:
+                raise ValueError(
+                    "Evidence embedding dimension mismatch: "
+                    f"artifact={artifact_dim}, expected={self.evidence_embedding_dim}"
+                )
+            self.evidence_rows_by_sample = evidence_index
+            self.evidence_artifact = dict(artifact)
         self.grounding_class_weights = self._grounding_class_weights(
             balance_grounding_classes
         )
@@ -346,6 +388,30 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
             "class_weights": self.grounding_class_weights,
         }
 
+    def evidence_distillation_summary(self) -> dict[str, Any]:
+        """Summarize the frozen rationale-embedding artifact before training."""
+        if self.evidence_artifact is None:
+            return {
+                "enabled": self.enable_evidence_distillation,
+                "artifact_entities": 0,
+                "artifact_samples": 0,
+                "embedding_dim": self.evidence_embedding_dim,
+                "max_entities_per_sample": self.evidence_max_entities,
+            }
+        return {
+            "enabled": self.enable_evidence_distillation,
+            "schema_version": self.evidence_artifact.get("schema_version"),
+            "artifact_entities": int(self.evidence_artifact["embeddings"].shape[0]),
+            "artifact_samples": len(self.evidence_rows_by_sample),
+            "embedding_dim": self.evidence_embedding_dim,
+            "max_entities_per_sample": self.evidence_max_entities,
+            "teacher_cache_sha256": self.evidence_artifact.get(
+                "teacher_cache_sha256"
+            ),
+            "input_sha256": self.evidence_artifact.get("input_sha256"),
+            "pooling": self.evidence_artifact.get("pooling"),
+        }
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
         sample = self.base_dataset[index]
         token_probs, image_scores = self._default_teacher(sample[0].shape[0])
@@ -378,11 +444,49 @@ class TeacherCacheDataset(Dataset[tuple[torch.Tensor, ...]]):
                     teacher_task=self.expected_teacher_task or "grounding",
                     visual_utility_threshold=self.visual_utility_threshold,
                 )
-        return (
+        base_result = (
             *sample,
             token_probs,
             image_scores,
             torch.tensor(available, dtype=torch.float),
             grounding_targets,
             grounding_weights,
+        )
+        if not self.enable_evidence_distillation:
+            return base_result
+
+        evidence_token_masks = torch.zeros(
+            (self.evidence_max_entities, sample[0].shape[0]), dtype=torch.float
+        )
+        evidence_image_targets = torch.zeros(
+            (self.evidence_max_entities, sample[5].shape[0]), dtype=torch.float
+        )
+        evidence_embeddings = torch.zeros(
+            (self.evidence_max_entities, self.evidence_embedding_dim),
+            dtype=torch.float,
+        )
+        evidence_weights = torch.zeros(self.evidence_max_entities, dtype=torch.float)
+        if self.evidence_artifact is not None:
+            (
+                evidence_token_masks,
+                evidence_image_targets,
+                evidence_embeddings,
+                evidence_weights,
+                _,
+            ) = build_evidence_distillation_targets(
+                words=self.base_dataset.examples["words"][index],
+                gold_labels=self.base_dataset.examples["labels"][index],
+                tokenizer=self.base_dataset.tokenizer,
+                max_sequence_length=sample[0].shape[0],
+                image_mask=sample[5],
+                artifact=self.evidence_artifact,
+                row_indices=self.evidence_rows_by_sample.get(index, []),
+                max_entities=self.evidence_max_entities,
+            )
+        return (
+            *base_result,
+            evidence_token_masks,
+            evidence_image_targets,
+            evidence_embeddings,
+            evidence_weights,
         )

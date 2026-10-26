@@ -112,6 +112,9 @@ class LlmNerTrainer(NerTrainer):
     def _step(
         self, batch: tuple[Any, ...]
     ) -> tuple[torch.Tensor, torch.Tensor, list[list[int]], torch.Tensor]:
+        if len(batch) not in {11, 15}:
+            raise ValueError(f"Unexpected LLM batch width: {len(batch)}")
+        base_batch = batch[:11]
         (
             input_ids,
             token_type_ids,
@@ -124,7 +127,14 @@ class LlmNerTrainer(NerTrainer):
             llm_available,
             llm_grounding_targets,
             llm_grounding_weights,
-        ) = batch
+        ) = base_batch
+        evidence_batch = batch[11:] if len(batch) == 15 else (None,) * 4
+        (
+            llm_evidence_token_masks,
+            llm_evidence_image_targets,
+            llm_evidence_embeddings,
+            llm_evidence_weights,
+        ) = evidence_batch
         routed_crf_weight = float(
             getattr(self.args, "llm_routed_crf_loss_weight", 0.0)
         )
@@ -173,6 +183,10 @@ class LlmNerTrainer(NerTrainer):
             llm_available=llm_available,
             llm_grounding_targets=llm_grounding_targets,
             llm_grounding_weights=llm_grounding_weights,
+            llm_evidence_token_masks=llm_evidence_token_masks,
+            llm_evidence_image_targets=llm_evidence_image_targets,
+            llm_evidence_embeddings=llm_evidence_embeddings,
+            llm_evidence_weights=llm_evidence_weights,
             return_features=use_routed_view,
         )
         if use_routed_view:

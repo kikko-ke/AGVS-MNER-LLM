@@ -2,7 +2,109 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前主线：V4 单编辑、多角色保守共识
+## 当前主线：V5 训练期 LLM 证据表征蒸馏
+
+V4 严格共识已经判定为 **no-go**：其开发集基线 F1 为 `0.828393`，所选
+原子编辑 oracle 为 `0.854460`，但三角色严格共识只接受 1 个中性编辑，最终
+F1 与基线完全相同；放宽规则均降低 F1。因此 V5 不再让 LLM 直接修改 CRF
+输出，也不再追加 API 请求。
+
+V5 复用已经生成的完整 grounding 缓存。只接受同时满足以下条件的训练实体：
+
+1. LLM 的 span/type 与训练集 gold 实体完全一致；
+2. `confidence >= 0.90`；
+3. `evidence` 非空，且至少引用一张当前可解码的有效图片。
+
+离线脚本用冻结的 BERT 编码 LLM 生成的视觉证据解释。训练时，学生从实体
+WordPiece 表征和 LLM 指定图片的 CLS 表征构造联合向量，并用余弦损失（可选
+小权重对比损失）对齐冻结的解释向量。默认阻断该辅助损失进入文本 BERT，
+只让它更新小型投影头与视觉路径。推理、validation 和 test 都不读取解释、
+LLM 或教师缓存，不增加推理 API、延迟或输入泄漏。
+
+当前缓存审计得到 `9,838` 个可用实体、覆盖 `7,094` 个训练样本；解释文本
+重复率约 `0.5%`。预计算产物同时记录训练文件与 grounding 缓存 SHA-256，
+训练时不匹配会直接中止。
+
+### V5-A：一次性预计算解释嵌入
+
+这一步不调用 LLM API。GPU 推荐；CPU 也可运行但更慢。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+
+python -u scripts/build_llm_evidence_embeddings.py \
+  --input dataset/text/MNER-UNI_train.txt \
+  --teacher-cache teacher_cache/siliconflow_qwen3vl32b_grounding/MNER-UNI_train.jsonl \
+  --bert-model /root/autodl-tmp/pretrained_models/bert-base-uncased \
+  --output teacher_cache/siliconflow_qwen3vl32b_grounding/MNER-UNI_train.evidence_embeddings.pt \
+  --device cuda \
+  --batch-size 64 \
+  --max-length 96 \
+  --confidence-threshold 0.90
+```
+
+输出还会生成同名 `.meta.json`。已经生成且 hash 正确时不应重复覆盖；确需
+重建时显式追加 `--overwrite`。
+
+### V5-B：只看 validation 的安全微调 pilot
+
+先从严格基线 checkpoint 初始化。下面只启用 V5 损失，显式关闭所有历史
+LLM 损失和推理融合，并用 `--skip-test` 封存 test。epoch 0 会先保存原基线，
+后续只有 validation F1 严格提高才替换它。
+
+```bash
+BASELINE=outputs_llm/strict_baseline_seed1234/uni_20261019_174846/best_model.pt
+EVIDENCE=teacher_cache/siliconflow_qwen3vl32b_grounding/MNER-UNI_train.evidence_embeddings.pt
+
+test -f "$BASELINE" || { echo "找不到严格基线"; exit 1; }
+test -f "$EVIDENCE" || { echo "找不到 V5 解释嵌入"; exit 1; }
+
+python -u run_llm.py \
+  --dataset UNI \
+  --data-path dataset/text \
+  --image-path dataset/images \
+  --twitter2017-image-path dataset/twitter2017_images \
+  --bert-model /root/autodl-tmp/pretrained_models/bert-base-uncased \
+  --vit-model /root/autodl-tmp/pretrained_models/ViTB-16 \
+  --teacher-cache teacher_cache/siliconflow_qwen3vl32b_grounding \
+  --teacher-cache-task grounding \
+  --llm-evidence-embedding-cache "$EVIDENCE" \
+  --output-dir outputs_llm/v5_evidence_cosine_w002_seed1234 \
+  --init-checkpoint "$BASELINE" \
+  --device cuda \
+  --num-epochs 5 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --lr 1e-5 \
+  --bert-lr 2e-6 \
+  --vit-lr 1e-6 \
+  --warmup-ratio 0.01 \
+  --weight-decay 0.01 \
+  --patience 3 \
+  --seed 1234 \
+  --image-dropout-prob 0 \
+  --llm-token-loss-weight 0 \
+  --llm-image-loss-weight 0 \
+  --llm-grounding-loss-weight 0 \
+  --llm-routed-crf-loss-weight 0 \
+  --llm-consistency-kl-weight 0 \
+  --no-llm-grounding-fusion \
+  --no-llm-utility-gate \
+  --llm-evidence-loss-weight 0.02 \
+  --llm-evidence-contrastive-weight 0 \
+  --llm-evidence-max-entities 8 \
+  --llm-evidence-detach-text \
+  --no-llm-evidence-detach-image \
+  --skip-test \
+  2>&1 | tee logs/train_v5_evidence_cosine_w002_seed1234.log
+```
+
+首轮判据：epoch 0 必须复现基线；最佳 validation F1 至少比 epoch 0 高
+`0.003`，并且优于相同学习率/epoch 的无 V5 continued-training 对照至少
+`0.003`。不满足就停止，不能用 test 继续调参。满足后再冻结配置，运行
+`42、1234、2026` 三个种子。
+
+## 历史 V4：单编辑、多角色保守共识
 
 V3 已完成并判定为 **no-go**：在旧 `meta_evaluation` 上，完整校准器仅取得
 `+0.00081` F1，只实现约 `1.55%` 的原子 oracle 增益；LLM 自报置信度也没有
