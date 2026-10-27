@@ -60,6 +60,7 @@ def main() -> None:
     status = Counter()
     entity_types = Counter()
     abstain_reasons = Counter()
+    rejection_reasons = Counter()
     ratios: list[float] = []
     word_counts: list[int] = []
     image_counts: list[int] = []
@@ -75,25 +76,33 @@ def main() -> None:
                 ratios.append(float(item["context_change_ratio"]))
                 word_counts.append(len(item.get("tokens", [])))
                 image_counts.append(len(item.get("used_image_ids", [])))
-            else:
+            elif state == "abstained":
                 abstain_reasons[str(item.get("abstain_reason", ""))] += 1
+            elif state == "rejected":
+                rejection_reasons[str(item.get("policy_rejection", ""))] += 1
     selected_count = len(selected)
     accepted_count = status["accepted"]
+    generated_count = accepted_count + status["abstained"]
     summary = {
         "schema_version": AUGMENTATION_SCHEMA_VERSION,
         "selected_requests": selected_count,
-        "valid_cached_responses": len(valid_ids),
-        "remaining_requests": selected_count - len(valid_ids),
-        "coverage": len(valid_ids) / selected_count if selected_count else 0.0,
+        "resolved_cached_requests": len(valid_ids),
+        "valid_generation_responses": generated_count,
+        "remaining_selected_requests": selected_count - len(valid_ids),
+        "resolved_coverage": len(valid_ids) / selected_count if selected_count else 0.0,
         "status": dict(status),
-        "acceptance_rate_over_cached": (
+        "acceptance_rate_over_resolved": (
             accepted_count / len(valid_ids) if valid_ids else 0.0
+        ),
+        "acceptance_rate_over_valid_generation": (
+            accepted_count / generated_count if generated_count else 0.0
         ),
         "accepted_entity_type_coverage": dict(entity_types),
         "mean_context_change_ratio": statistics.mean(ratios) if ratios else None,
         "mean_augmented_words": statistics.mean(word_counts) if word_counts else None,
         "mean_cited_images": statistics.mean(image_counts) if image_counts else None,
         "abstain_reasons": dict(abstain_reasons),
+        "policy_rejection_reasons": dict(rejection_reasons),
         "input_sha256": metadata["input_sha256"],
         "cache_sha256": sha256_file(cache_path),
     }

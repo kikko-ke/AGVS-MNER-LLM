@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--retry-base-delay", type=float, default=2.0)
     parser.add_argument("--request-delay", type=float, default=1.0)
     parser.add_argument("--max-consecutive-failures", type=int, default=20)
@@ -278,6 +278,20 @@ def load_existing_records(
                 raise ValueError(f"LLM model mismatch at line {line_number}")
             if cached.get("source_fingerprint") != source_record["source_fingerprint"]:
                 raise ValueError(f"source fingerprint mismatch at line {line_number}")
+            status = cached.get("status")
+            if status == "rejected":
+                if not str(cached.get("policy_rejection", "")).strip():
+                    raise ValueError(
+                        f"rejected cache record lacks policy_rejection at line {line_number}"
+                    )
+                if cached.get("labels") not in (None, []):
+                    raise ValueError(
+                        f"rejected cache record must not carry labels at line {line_number}"
+                    )
+                existing.add(sample_id)
+                continue
+            if status not in {"accepted", "abstained"}:
+                raise ValueError(f"unknown cache status at line {line_number}")
             valid_ids = set(map(int, cached.get("valid_image_ids", [])))
             response = validate_augmentation_output(
                 _response_payload(cached),
@@ -296,6 +310,10 @@ def load_existing_records(
                 )
                 if cached.get("labels") != expected_labels:
                     raise ValueError(f"cached labels mismatch at line {line_number}")
+                if status != "accepted":
+                    raise ValueError(f"accepted status mismatch at line {line_number}")
+            elif status != "abstained":
+                raise ValueError(f"abstained status mismatch at line {line_number}")
             existing.add(sample_id)
     return existing
 
@@ -354,7 +372,7 @@ def main() -> None:
         record for record in selected_records if record["sample_id"] not in existing
     ]
     print(
-        f"[resume] {len(existing)} valid augmentation responses; "
+        f"[resume] {len(existing)} resolved augmentation requests; "
         f"{len(remaining)} selected requests remain",
         flush=True,
     )
@@ -363,7 +381,7 @@ def main() -> None:
     image_root = Path(args.image_root)
     twitter_root = Path(args.twitter_image_root)
     error_path = output.with_name(output.name + ".errors.jsonl")
-    attempted = succeeded = accepted = abstained = failed = consecutive_failures = 0
+    attempted = succeeded = accepted = abstained = rejected = failed = consecutive_failures = 0
     output_mode = "a" if args.resume else "x"
     with (
         output.open(output_mode, encoding="utf-8") as destination,
@@ -375,6 +393,7 @@ def main() -> None:
                 break
             attempted += 1
             sample_id = int(record["sample_id"])
+            started = time.perf_counter()
             try:
                 paths: list[Path | None] = [
                     image_path(name, image_root, twitter_root)
@@ -392,7 +411,6 @@ def main() -> None:
                             f"{args.max_seq_length - 2}"
                         )
 
-                started = time.perf_counter()
                 response = client.complete_augmentation_json(
                     record["words"],
                     paths,
@@ -434,11 +452,55 @@ def main() -> None:
                 succeeded += 1
                 consecutive_failures = 0
                 print(
-                    f"[progress] total valid {len(existing) + succeeded}/"
-                    f"{len(selected_records)}; accepted={accepted}, abstained={abstained} "
+                    f"[progress] total resolved {len(existing) + succeeded + rejected}/"
+                    f"{len(selected_records)}; accepted={accepted}, abstained={abstained}, "
+                    f"rejected={rejected} "
                     f"(sample_id={sample_id}, status={cached['status']})",
                     flush=True,
                 )
+                if args.request_delay:
+                    time.sleep(args.request_delay)
+            except ValueError as error:
+                rejected += 1
+                consecutive_failures = 0
+                latency = time.perf_counter() - started
+                cached = {
+                    "schema_version": AUGMENTATION_SCHEMA_VERSION,
+                    "prompt_version": AUGMENTATION_PROMPT_VERSION,
+                    "sample_id": sample_id,
+                    "source_fingerprint": record["source_fingerprint"],
+                    "llm_model": client.model,
+                    "source_entity_types": sorted(_entity_types(record)),
+                    "images": record["images"],
+                    "valid_image_ids": [],
+                    "status": "rejected",
+                    "policy_rejection": str(error),
+                    "labels": [],
+                    "request_latency_seconds": latency,
+                    "request_attempts": client.last_attempt_count,
+                    "usage": client.last_response_usage,
+                }
+                destination.write(json.dumps(cached, ensure_ascii=False) + "\n")
+                destination.flush()
+                print(
+                    f"[REJECTED] total resolved "
+                    f"{len(existing) + succeeded + rejected}/{len(selected_records)}; "
+                    f"sample_id={sample_id}: {error}",
+                    flush=True,
+                )
+                error_file.write(
+                    json.dumps(
+                        {
+                            "sample_id": sample_id,
+                            "source_fingerprint": record["source_fingerprint"],
+                            "status": "rejected",
+                            "error": str(error),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                error_file.flush()
                 if args.request_delay:
                     time.sleep(args.request_delay)
             except Exception as error:
@@ -471,8 +533,9 @@ def main() -> None:
     print(f"Succeeded responses: {succeeded}")
     print(f"Accepted augmentations this run: {accepted}")
     print(f"Valid abstentions this run: {abstained}")
-    print(f"Failed requests: {failed}")
-    print(f"Total cached responses: {len(existing) + succeeded}")
+    print(f"Policy-rejected responses this run: {rejected}")
+    print(f"Unresolved request failures: {failed}")
+    print(f"Total resolved cache records: {len(existing) + succeeded + rejected}")
     print(f"Cache: {output}")
     print(f"Metadata: {metadata_path}")
     print(f"Errors: {error_path}")

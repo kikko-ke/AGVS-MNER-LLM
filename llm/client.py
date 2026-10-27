@@ -218,6 +218,7 @@ class LLMTeacherClient:
         self.last_attempt_count = 0
         self.last_response_usage = None
         for attempt in range(self.max_retries + 1):
+            self.last_attempt_count = attempt + 1
             current_temperature = (
                 retry_temperature
                 if attempt > 0 and retry_temperature is not None
@@ -252,7 +253,6 @@ class LLMTeacherClient:
                     envelope = json.loads(response.read().decode("utf-8"))
                 parsed = self._parse_json_response(envelope)
                 validated = validator(parsed) if validator is not None else parsed
-                self.last_attempt_count = attempt + 1
                 usage = envelope.get("usage") if isinstance(envelope, Mapping) else None
                 self.last_response_usage = dict(usage) if isinstance(usage, Mapping) else None
                 return validated

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from llm.augmentation_schema import (
 from llm.client import LLMTeacherClient
 from scripts import build_augmented_dataset
 from scripts.build_llm_augmentation_cache import (
+    load_existing_records,
     select_source_records,
     sha256_file,
 )
@@ -182,6 +184,37 @@ def test_selection_is_reproducible_and_balances_target_types():
     selected_types = [next(iter({e.label for e in item["entities"]})) for item in first]
     assert selected_types.count("MIS") == 3
     assert selected_types.count("ORG") == 3
+
+
+def test_policy_rejection_is_a_resolved_non_training_cache_record(tmp_path):
+    source = _selection_record(0, "MIS")
+    cache = tmp_path / "augmentation.jsonl"
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": AUGMENTATION_SCHEMA_VERSION,
+                "prompt_version": AUGMENTATION_PROMPT_VERSION,
+                "sample_id": 0,
+                "source_fingerprint": source["source_fingerprint"],
+                "llm_model": "model",
+                "status": "rejected",
+                "policy_rejection": "context was unchanged",
+                "labels": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args = Namespace(
+        min_context_change_ratio=0.15,
+        max_context_change_ratio=0.85,
+        min_length_ratio=0.60,
+        max_length_ratio=1.50,
+        max_words=62,
+    )
+    assert load_existing_records(
+        cache, {0: source}, model="model", args=args
+    ) == {0}
 
 
 def test_dataset_builder_writes_llm_arm_and_matched_control(tmp_path, monkeypatch):

@@ -20,8 +20,10 @@ surface、数量、顺序和类型不再属于生成空间。提示词禁止新�
 WordPiece 的结果。无法安全改写时允许 abstain，abstain 只缓存不训练。
 
 首轮固定 route seed `20261027`，目标类别为弱项 MIS/ORG，预先选择 1,000 个
-训练样本。只请求前 20 条做 schema smoke；要求 20 条响应全部形成合法缓存、
-accepted 至少 10 条且同时覆盖 MIS/ORG。通过后在同一 metadata/cache 上断点
+训练样本。只请求前 20 条做 schema smoke；accepted、abstained 和未通过安全门的
+rejected 都形成可审计且不会进入训练的 resolved cache record，网络/API 失败则
+保持 unresolved 以便恢复。要求 resolved=20、accepted 至少 10 条且同时覆盖
+MIS/ORG。通过后在同一 metadata/cache 上断点
 续传至 1,000 个请求。正式 pilot 生成两个新增数量相同的数据臂：
 
 1. `LLM augmentation`：原训练集加 accepted 图像一致改写；

@@ -50,7 +50,7 @@ python -u scripts/build_llm_augmentation_cache.py \
   --model "$LLM_MODEL" \
   --timeout 300 \
   --max-tokens 1024 \
-  --max-retries 5 \
+  --max-retries 2 \
   --request-delay 1 \
   --max-consecutive-failures 20 \
   --limit 20 \
@@ -63,9 +63,11 @@ python -u scripts/audit_llm_augmentation.py \
   2>&1 | tee logs/v61_augmentation_smoke_audit.log
 ```
 
-Smoke 只检查协议：应有 20 条合法缓存响应、0 条未恢复的格式失败、至少 10 条
-accepted，并且 accepted 同时覆盖 MIS 与 ORG。未通过时先审计拒绝原因，不能直接
-扩大请求。它不使用 validation/test，也不用于声称性能提升。
+Smoke 只检查协议：20 个请求都应成为 resolved cache record；只有 accepted 才会
+进入训练，abstained 和最终未通过安全门的 rejected 都永久跳过、不会在 resume 时
+重复付费。要求至少 10 条 accepted，并且 accepted 同时覆盖 MIS 与 ORG；允许安全
+rejected，但不能有 unresolved transport/API failure。未通过时先审计原因，不能
+直接扩大请求。它不使用 validation/test，也不用于声称性能提升。
 
 ### V6.1-B：扩到 1,000 个训练请求并构建配对数据
 
