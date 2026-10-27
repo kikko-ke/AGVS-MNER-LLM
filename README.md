@@ -2,7 +2,7 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前主线：V6 标签保持的多模态训练增强
+## 当前主线：V6.1 锁定实体的多模态训练增强
 
 V5.1 受保护适配器稳定地保持了强基线，但没有产生有意义的 validation 增益：
 epoch 0 为 `0.8179`，后续最佳仍约为 `0.8179`，未达到预注册的 `0.8209`。
@@ -10,14 +10,17 @@ epoch 0 为 `0.8179`，后续最佳仍约为 `0.8179`，未达到预注册的 `0
 解释与 validation 错误之间的监督相关性不足。V5 因此判定为 **no-go**，不运行
 test，也不继续调 adapter 权重。
 
-V6 不再蒸馏 LLM 的标签或隐藏表征。Qwen3-VL 只在训练集上观察原文本和图片，
-改写实体之外的上下文。程序锁定每个 gold 实体的原始 token、顺序、数量和类型，
-并重新构造 BIO 标签。以下输出会被拒绝：实体漂移、可疑的新名字/账号/URL、没有
-引用实际发送图片、上下文几乎未改或改写过度、以及超过 BERT 长度预算。安全
-abstention 会进入缓存但不会进入训练集。validation/test 原样复制，不调用 LLM；
-部署也不需要 LLM。
+V6 不再蒸馏 LLM 的标签或隐藏表征。初版 V6 让模型返回完整句子和实体 span，
+20 次 smoke 只有 7 个合法响应（5 accepted、2 abstained），补跑失败样本仍为
+0/13，主要错误是实体 surface 漂移和 span 计算错误，因此判定协议 no-go。
+V6.1 改为让 Qwen3-VL 只返回实体之间的 `context_segments`；程序按固定顺序插回
+每个 gold 实体的原始 token，自动计算 span 并重建 BIO 标签。从结构上模型不再
+能够修改、遗漏、重排或重叠实体。提示词禁止引入新专名；程序还会拒绝上下文中
+新增的账号/URL/hashtag、未引用实际图片、改写幅度异常和超过 BERT 长度预算。
+安全 abstention 会进入缓存但不会进入
+训练集。validation/test 原样复制，部署也不需要 LLM。
 
-### V6-A：20 次请求的 smoke（CPU/无卡模式即可）
+### V6.1-A：20 次请求的 smoke（CPU/无卡模式即可）
 
 先选择 1,000 个包含 MIS/ORG 的训练样本，但用 `--limit 20` 只请求前 20 个。
 这样 smoke 通过后删除 `--limit 20` 即可在同一缓存上断点续传，不会重复付费。
@@ -29,12 +32,12 @@ export LLM_BASE_URL=https://api.siliconflow.cn/v1
 export LLM_MODEL=Qwen/Qwen3-VL-32B-Instruct
 test -n "$LLM_API_KEY" || { echo "缺少 LLM_API_KEY"; exit 1; }
 
-mkdir -p augmentation_cache/qwen3vl32b_v6 logs
+mkdir -p augmentation_cache/qwen3vl32b_v61 logs
 set -o pipefail
 
 python -u scripts/build_llm_augmentation_cache.py \
   --input dataset/text/MNER-UNI_train.txt \
-  --output augmentation_cache/qwen3vl32b_v6/MNER-UNI_train.jsonl \
+  --output augmentation_cache/qwen3vl32b_v61/MNER-UNI_train.jsonl \
   --image-root dataset/images \
   --twitter-image-root dataset/twitter2017_images \
   --bert-model /root/autodl-tmp/pretrained_models/bert-base-uncased \
@@ -52,19 +55,19 @@ python -u scripts/build_llm_augmentation_cache.py \
   --max-consecutive-failures 20 \
   --limit 20 \
   --resume \
-  2>&1 | tee -a logs/v6_augmentation_smoke.log
+  2>&1 | tee -a logs/v61_augmentation_smoke.log
 
 python -u scripts/audit_llm_augmentation.py \
   --input dataset/text/MNER-UNI_train.txt \
-  --cache augmentation_cache/qwen3vl32b_v6/MNER-UNI_train.jsonl \
-  2>&1 | tee logs/v6_augmentation_smoke_audit.log
+  --cache augmentation_cache/qwen3vl32b_v61/MNER-UNI_train.jsonl \
+  2>&1 | tee logs/v61_augmentation_smoke_audit.log
 ```
 
 Smoke 只检查协议：应有 20 条合法缓存响应、0 条未恢复的格式失败、至少 10 条
 accepted，并且 accepted 同时覆盖 MIS 与 ORG。未通过时先审计拒绝原因，不能直接
 扩大请求。它不使用 validation/test，也不用于声称性能提升。
 
-### V6-B：扩到 1,000 个训练请求并构建配对数据
+### V6.1-B：扩到 1,000 个训练请求并构建配对数据
 
 Smoke 通过后，原命令保持所有参数不变，仅删除 `--limit 20` 再运行。缓存达到
 1,000 条合法响应后重新执行 audit，然后构建 LLM 增强组和等量重复原样本对照组：
@@ -72,14 +75,14 @@ Smoke 通过后，原命令保持所有参数不变，仅删除 `--limit 20` 再
 ```bash
 python -u scripts/build_augmented_dataset.py \
   --input-dir dataset/text \
-  --cache augmentation_cache/qwen3vl32b_v6/MNER-UNI_train.jsonl \
-  --output-dir dataset/v6_llm_aug_seed20261027 \
-  --control-output-dir dataset/v6_duplicate_control_seed20261027
+  --cache augmentation_cache/qwen3vl32b_v61/MNER-UNI_train.jsonl \
+  --output-dir dataset/v61_llm_aug_seed20261027 \
+  --control-output-dir dataset/v61_duplicate_control_seed20261027
 ```
 
 两个训练集的新增样本数完全一致；对照组新增的是同一批 source sample 的原始
 副本，因此可以区分“LLM 上下文多样性”与“更多训练步/类别重采样”。先用 seed
-1234、相同超参数分别从头训练，始终加 `--skip-test`。V6 只有在 validation 上
+1234、相同超参数分别从头训练，始终加 `--skip-test`。V6.1 只有在 validation 上
 同时比原始严格基线和 duplicate control 高至少 `0.003` 时才进入三种子确认；
 否则停止。达到 `0.86` 仍是实验目标，不是预先保证的结果。
 

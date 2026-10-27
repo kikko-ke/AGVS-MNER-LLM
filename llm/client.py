@@ -207,26 +207,37 @@ class LLMTeacherClient:
         prepared_images: Sequence[str | None],
         *,
         validator: Callable[[dict[str, Any]], _ValidatedJson] | None = None,
+        temperature: float = 0.0,
+        retry_temperature: float | None = None,
     ) -> dict[str, Any] | _ValidatedJson:
-        request_body = {
-            "model": self.model,
-            "temperature": 0.0,
-            "max_tokens": self.max_tokens,
-            "stream": False,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": self._user_content(user_text, prepared_images),
-                },
-            ],
-        }
-        request_data = json.dumps(request_body).encode("utf-8")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be between 0 and 2")
+        if retry_temperature is not None and not 0.0 <= retry_temperature <= 2.0:
+            raise ValueError("retry_temperature must be between 0 and 2")
         retryable_statuses = {429, 500, 502, 503, 504}
         self.last_attempt_count = 0
         self.last_response_usage = None
         for attempt in range(self.max_retries + 1):
+            current_temperature = (
+                retry_temperature
+                if attempt > 0 and retry_temperature is not None
+                else temperature
+            )
+            request_body = {
+                "model": self.model,
+                "temperature": current_temperature,
+                "max_tokens": self.max_tokens,
+                "stream": False,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": self._user_content(user_text, prepared_images),
+                    },
+                ],
+            }
+            request_data = json.dumps(request_body).encode("utf-8")
             request = urllib.request.Request(
                 self.endpoint,
                 data=request_data,
@@ -369,6 +380,8 @@ class LLMTeacherClient:
             user_text,
             prepared_images,
             validator=validate,
+            temperature=0.1,
+            retry_temperature=0.6,
         )
         assert isinstance(result, AugmentationResponse)
         return result

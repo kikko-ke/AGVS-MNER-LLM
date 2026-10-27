@@ -88,8 +88,7 @@ def _load_accepted(
                 field: cached.get(field)
                 for field in (
                     "abstain",
-                    "tokens",
-                    "entity_spans",
+                    "context_segments",
                     "used_image_ids",
                     "change_summary",
                     "abstain_reason",

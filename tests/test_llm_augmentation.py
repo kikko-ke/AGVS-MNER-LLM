@@ -29,8 +29,10 @@ SOURCE_LABELS = ["O", "B-ORG", "I-ORG", "O", "O", "O"]
 def accepted_payload() -> dict:
     return {
         "abstain": False,
-        "tokens": ["watching", "Acme", "Corp", "beside", "the", "bright", "arena"],
-        "entity_spans": [{"entity_id": "E0", "start": 1, "end": 3}],
+        "context_segments": [
+            ["watching"],
+            ["beside", "the", "bright", "arena"],
+        ],
         "used_image_ids": [0],
         "change_summary": "the visible stage changes the local setting",
         "abstain_reason": "",
@@ -55,8 +57,7 @@ def test_abstention_is_valid_but_contains_no_training_example():
     response = validate_augmentation_output(
         {
             "abstain": True,
-            "tokens": [],
-            "entity_spans": [],
+            "context_segments": [],
             "used_image_ids": [],
             "change_summary": "",
             "abstain_reason": "image does not support a safe rewrite",
@@ -73,15 +74,15 @@ def test_abstention_is_valid_but_contains_no_training_example():
     ("mutator", "message"),
     [
         (
-            lambda payload: payload["tokens"].__setitem__(1, "Other"),
-            "changed protected entity",
+            lambda payload: payload["context_segments"][1].extend(["Acme", "Corp"]),
+            "duplicated protected entity",
         ),
         (
             lambda payload: payload["used_image_ids"].__setitem__(0, 3),
             "was not sent",
         ),
         (
-            lambda payload: payload["tokens"].__setitem__(5, "@new_account"),
+            lambda payload: payload["context_segments"][1].__setitem__(2, "@new_account"),
             "suspicious named context",
         ),
     ],
@@ -99,6 +100,24 @@ def test_bio_parser_rejects_orphan_inside_label():
         extract_protected_entities(["Acme"], ["I-ORG"])
 
 
+def test_context_segment_count_is_structurally_enforced():
+    entities = extract_protected_entities(SOURCE_WORDS, SOURCE_LABELS)
+    payload = accepted_payload()
+    payload["context_segments"] = [payload["context_segments"][0]]
+    with pytest.raises(ValueError, match="exactly 2 lists"):
+        validate_augmentation_output(payload, SOURCE_WORDS, entities, {0})
+
+
+def test_generated_context_case_is_canonicalized_without_touching_entity_surface():
+    entities = extract_protected_entities(SOURCE_WORDS, SOURCE_LABELS)
+    payload = accepted_payload()
+    payload["context_segments"][1][2] = "BRIGHT"
+    response = validate_augmentation_output(payload, SOURCE_WORDS, entities, {0})
+    assert response.tokens[1:3] == ("Acme", "Corp")
+    assert "bright" in response.tokens
+    assert "BRIGHT" not in response.tokens
+
+
 def test_client_validates_before_returning(monkeypatch):
     entities = extract_protected_entities(SOURCE_WORDS, SOURCE_LABELS)
     client = LLMTeacherClient(
@@ -113,10 +132,20 @@ def test_client_validates_before_returning(monkeypatch):
         lambda paths: (list(paths), ["data:image/jpeg;base64,AA==", None]),
     )
 
-    def fake_complete(system_prompt, user_text, prepared_images, *, validator):
+    def fake_complete(
+        system_prompt,
+        user_text,
+        prepared_images,
+        *,
+        validator,
+        temperature,
+        retry_temperature,
+    ):
         assert AUGMENTATION_PROMPT_VERSION in system_prompt
         assert "Protected entities" in user_text
         assert len(prepared_images) == 2
+        assert temperature == 0.1
+        assert retry_temperature == 0.6
         return validator(accepted_payload())
 
     monkeypatch.setattr(client, "_complete_prepared_json", fake_complete)

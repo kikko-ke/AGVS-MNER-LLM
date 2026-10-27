@@ -9,8 +9,8 @@ from difflib import SequenceMatcher
 from typing import Any, Mapping, Sequence
 
 
-AUGMENTATION_PROMPT_VERSION = "multimodal-label-preserving-augmentation-v1"
-AUGMENTATION_SCHEMA_VERSION = "multimodal-label-preserving-augmentation-cache-v1"
+AUGMENTATION_PROMPT_VERSION = "multimodal-locked-context-segments-v2"
+AUGMENTATION_SCHEMA_VERSION = "multimodal-locked-context-segments-cache-v2"
 ENTITY_TYPES = frozenset({"LOC", "MIS", "ORG", "PER"})
 _URL_RE = re.compile(r"(?i)(?:https?://|www\.|\S+\.com(?:/|$))")
 
@@ -52,6 +52,7 @@ class AugmentationResponse:
     """Validated response; abstentions are valid cache records but not examples."""
 
     abstain: bool
+    context_segments: tuple[tuple[str, ...], ...]
     tokens: tuple[str, ...]
     entity_spans: tuple[AugmentedEntitySpan, ...]
     used_image_ids: tuple[int, ...]
@@ -62,6 +63,7 @@ class AugmentationResponse:
     def to_dict(self) -> dict[str, Any]:
         return {
             "abstain": self.abstain,
+            "context_segments": [list(segment) for segment in self.context_segments],
             "tokens": list(self.tokens),
             "entity_spans": [span.to_dict() for span in self.entity_spans],
             "used_image_ids": list(self.used_image_ids),
@@ -121,20 +123,28 @@ def _strict_int(value: Any, field: str) -> int:
     return value
 
 
-def _validated_tokens(value: Any, *, max_words: int) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise ValueError("tokens must be a non-empty list")
-    if len(value) > max_words:
-        raise ValueError(f"augmentation exceeds max_words={max_words}")
+def _validated_context_segment(value: Any, segment_index: int) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"context segment {segment_index} must be a list")
     tokens: list[str] = []
     for index, token in enumerate(value):
         if not isinstance(token, str):
-            raise ValueError(f"token {index} must be a string")
+            raise ValueError(
+                f"context segment {segment_index} token {index} must be a string"
+            )
         if not token or token.strip() != token or any(char.isspace() for char in token):
-            raise ValueError(f"token {index} must be one non-empty whitespace-free token")
+            raise ValueError(
+                f"context segment {segment_index} token {index} must be one "
+                "non-empty whitespace-free token"
+            )
         if len(token) > 80:
-            raise ValueError(f"token {index} is unreasonably long")
-        tokens.append(token)
+            raise ValueError(
+                f"context segment {segment_index} token {index} is unreasonably long"
+            )
+        # BERT is uncased in this project.  Canonicalising generated context avoids
+        # treating ordinary sentence/title capitalisation as a new entity signal;
+        # protected entities are inserted separately and retain their exact surface.
+        tokens.append(token if token == "I" else token.casefold())
     return tuple(tokens)
 
 
@@ -155,33 +165,35 @@ def _context_change_ratio(source: Sequence[str], augmented: Sequence[str]) -> fl
     return 1.0 - SequenceMatcher(a=tuple(source), b=tuple(augmented)).ratio()
 
 
-def _suspicious_new_context_tokens(
-    source_words: Sequence[str],
-    source_entities: Sequence[ProtectedEntity],
-    augmented_words: Sequence[str],
-    augmented_spans: Sequence[AugmentedEntitySpan],
+def _suspicious_context_tokens(
+    segments: Sequence[Sequence[str]],
 ) -> list[str]:
-    source_context = _context_tokens(
-        source_words,
-        [(entity.start, entity.end) for entity in source_entities],
-    )
-    source_vocabulary = set(source_context)
-    augmented_context_positions = {
-        index
-        for span in augmented_spans
-        for index in range(span.start, span.end)
-    }
-    suspicious: list[str] = []
-    for index, token in enumerate(augmented_words):
-        if index in augmented_context_positions or token.casefold() in source_vocabulary:
-            continue
-        if (
-            token.startswith(("@", "#"))
-            or _URL_RE.search(token)
-            or (token[:1].isalpha() and token[:1].isupper() and token != "I")
-        ):
-            suspicious.append(token)
-    return suspicious
+    return [
+        token
+        for segment in segments
+        for token in segment
+        if token.startswith(
+            ("@", "#", "tokens_before_", "tokens_between_", "tokens_after_")
+        )
+        or _URL_RE.search(token)
+    ]
+
+
+def _contains_protected_surface(
+    segments: Sequence[Sequence[str]], entities: Sequence[ProtectedEntity]
+) -> str | None:
+    """Prevent a context segment from duplicating any protected entity."""
+    for entity in entities:
+        needle = tuple(token.casefold() for token in entity.tokens)
+        for segment in segments:
+            haystack = tuple(token.casefold() for token in segment)
+            width = len(needle)
+            if width and any(
+                haystack[index : index + width] == needle
+                for index in range(len(haystack) - width + 1)
+            ):
+                return entity.entity_id
+    return None
 
 
 def validate_augmentation_output(
@@ -196,7 +208,7 @@ def validate_augmentation_output(
     max_length_ratio: float = 1.50,
     max_words: int = 96,
 ) -> AugmentationResponse:
-    """Reject entity drift, ungrounded rewrites, copies, and suspicious new names."""
+    """Build locked entities around validated, image-grounded context segments."""
     if not isinstance(payload, Mapping):
         raise ValueError("augmentation output must be a JSON object")
     abstain = payload.get("abstain")
@@ -206,11 +218,12 @@ def validate_augmentation_output(
     if abstain:
         if not abstain_reason:
             raise ValueError("an abstention must include abstain_reason")
-        for field in ("tokens", "entity_spans", "used_image_ids"):
+        for field in ("context_segments", "used_image_ids"):
             if payload.get(field, []) not in (None, []):
                 raise ValueError(f"an abstention must leave {field} empty")
         return AugmentationResponse(
             abstain=True,
+            context_segments=(),
             tokens=(),
             entity_spans=(),
             used_image_ids=(),
@@ -223,30 +236,38 @@ def validate_augmentation_output(
         raise ValueError("accepted augmentation requires at least one protected entity")
     if not valid_image_ids:
         raise ValueError("accepted augmentation requires a decodable image")
-    tokens = _validated_tokens(payload.get("tokens"), max_words=max_words)
-    raw_spans = payload.get("entity_spans")
-    if not isinstance(raw_spans, list):
-        raise ValueError("entity_spans must be a list")
-    expected_ids = [entity.entity_id for entity in protected_entities]
-    if len(raw_spans) != len(expected_ids):
-        raise ValueError("entity_spans must contain every protected entity exactly once")
+    raw_segments = payload.get("context_segments")
+    expected_segment_count = len(protected_entities) + 1
+    if not isinstance(raw_segments, list) or len(raw_segments) != expected_segment_count:
+        raise ValueError(
+            f"context_segments must contain exactly {expected_segment_count} lists"
+        )
+    context_segments = tuple(
+        _validated_context_segment(value, index)
+        for index, value in enumerate(raw_segments)
+    )
+    duplicated_entity = _contains_protected_surface(
+        context_segments, protected_entities
+    )
+    if duplicated_entity is not None:
+        raise ValueError(
+            f"context segments duplicated protected entity {duplicated_entity}"
+        )
+
+    tokens: list[str] = []
     spans: list[AugmentedEntitySpan] = []
-    for raw_span in raw_spans:
-        if not isinstance(raw_span, Mapping):
-            raise ValueError("each entity span must be an object")
-        entity_id = str(raw_span.get("entity_id", ""))
-        start = _strict_int(raw_span.get("start"), "entity start")
-        end = _strict_int(raw_span.get("end"), "entity end")
-        if start < 0 or end <= start or end > len(tokens):
-            raise ValueError(f"invalid augmented entity span [{start}, {end})")
-        spans.append(AugmentedEntitySpan(entity_id, start, end))
-    if [span.entity_id for span in spans] != expected_ids:
-        raise ValueError("protected entities must occur once and in their original order")
-    if any(left.end > right.start for left, right in zip(spans, spans[1:])):
-        raise ValueError("augmented entity spans must not overlap")
-    for entity, span in zip(protected_entities, spans):
-        if tuple(tokens[span.start : span.end]) != entity.tokens:
-            raise ValueError(f"augmentation changed protected entity {entity.entity_id}")
+    for segment, entity in zip(context_segments, protected_entities):
+        tokens.extend(segment)
+        start = len(tokens)
+        tokens.extend(entity.tokens)
+        spans.append(
+            AugmentedEntitySpan(entity.entity_id, start, len(tokens))
+        )
+    tokens.extend(context_segments[-1])
+    if not tokens:
+        raise ValueError("accepted augmentation must not be empty")
+    if len(tokens) > max_words:
+        raise ValueError(f"augmentation exceeds max_words={max_words}")
 
     raw_image_ids = payload.get("used_image_ids")
     if not isinstance(raw_image_ids, list) or not raw_image_ids:
@@ -277,9 +298,7 @@ def validate_augmentation_output(
             f"context change ratio {change_ratio:.3f} is outside "
             f"[{min_context_change_ratio}, {max_context_change_ratio}]"
         )
-    suspicious = _suspicious_new_context_tokens(
-        source_words, protected_entities, tokens, spans
-    )
+    suspicious = _suspicious_context_tokens(context_segments)
     if suspicious:
         raise ValueError(
             "augmentation introduced suspicious named context tokens: "
@@ -292,7 +311,8 @@ def validate_augmentation_output(
         raise ValueError("accepted augmentation must leave abstain_reason empty")
     return AugmentationResponse(
         abstain=False,
-        tokens=tokens,
+        context_segments=context_segments,
+        tokens=tuple(tokens),
         entity_spans=tuple(spans),
         used_image_ids=tuple(sorted(image_ids)),
         change_summary=change_summary[:240],
