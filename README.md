@@ -2,7 +2,53 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前主线：V6.1 锁定实体的多模态训练增强
+## 当前实验：复用 V6.1 checkpoint 的固定 CRF 分数融合
+
+V6.1 的 seed 1234 验证结果为：严格基线 `0.8142`、重复样本对照 `0.8187`、
+LLM 增强 `0.8175`。因此原先要求同时超过两种对照 `0.003` 的单模型实验为
+**no-go**，此结论保留。下面是以小幅增益为目标的新探索，不需要追加 LLM 请求
+或训练。三个 checkpoint 分别前向一次，并将 emission 与 CRF 起始、结束和标签
+转移势能一起按权重融合，再进行原有 Viterbi 解码。
+
+固定七组：control 单模型；`0.9/0.8/0.7 control + 0.1/0.2/0.3 baseline`；
+`0.9/0.8/0.7 control + 0.1/0.2/0.3 llm`。使用同一个 validation 文件、分词与
+标签映射，不改变 BIO/WordPiece 解码约束。脚本先核验三个单模型的 F1 能否复现
+各自 metrics.csv（允许 0.0005 差异），以及 CPU 重放与原生 CRF 解码的词级结果
+是否完全相同；配置、数据 hash 或复现不一致时终止。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p logs
+result_dir="outputs_v61/crf_ensemble_seed1234_$(date +%Y%m%d_%H%M%S)"
+set -o pipefail
+
+python -u scripts/evaluate_crf_ensemble.py \
+  --baseline outputs_v61/strict_baseline_seed1234/uni_20261030_180619/best_model.pt \
+  --control outputs_v61/duplicate_control_seed1234/uni_20261030_193709/best_model.pt \
+  --llm outputs_v61/llm_augmentation_seed1234/uni_20261030_221735/best_model.pt \
+  --data-path dataset/text \
+  --split val \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  --output "$result_dir/val_metrics.json" \
+  2>&1 | tee "logs/v61_crf_ensemble_$(date +%Y%m%d_%H%M%S).log"
+
+status=${PIPESTATUS[0]}
+echo "Evaluation exit status: $status"
+```
+
+结果保存在 `val_metrics.json`，候选权重和 checkpoint hash 保存在同目录的
+`val_metrics.policy.json`。三个模型依次加载，GPU 不必同时容纳三个模型。
+单模型结果和两模型互补错误统计是诊断项，正式比较表始终只有上述七个策略。
+LLM 融合必须超过 control **以及最好的无 LLM 融合**才算观察到额外增益；
+`llm_increment_observed_on_validation=true` 仍只是验证集探索，需独立确认，
+不表示显著性或测试集收益。打平时保留无 LLM 方案。只有普通集成改善时不能
+宣称 LLM 有贡献。脚本不支持 test 权重搜索，部署候选最多需要两个模型前向。
+
+## 历史 V6.1：锁定实体的多模态训练增强
 
 V5.1 受保护适配器稳定地保持了强基线，但没有产生有意义的 validation 增益：
 epoch 0 为 `0.8179`，后续最佳仍约为 `0.8179`，未达到预注册的 `0.8209`。

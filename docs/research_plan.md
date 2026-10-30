@@ -1,6 +1,30 @@
-# 研究计划：训练期 MLLM 标签保持增强
+# 研究计划：复用现有 checkpoint 的 CRF 融合探索
 
-## 当前主方法：V6.1 Locked-Entity Multimodal Augmentation
+## 当前实验：固定七组 CRF 分数融合
+
+V6.1 单模型 pilot 已完成：严格基线 dev F1 `0.8142`、duplicate control
+`0.8187`、LLM augmentation `0.8175`（seed 1234，均 epoch 3 最佳）。LLM 臂
+比 duplicate control 低 `0.0012`，原协议判定 **no-go**，不追认成成功。
+最终 1,000 条已处理请求中有 344 accepted、100 abstained、556 rejected；
+缓存生成阶段结束。
+
+用户将新探索目标改为小幅性能提高。仅使用现有三个 checkpoint，固定比较：
+control 单模型；control 与 baseline 按 `0.9/0.1、0.8/0.2、0.7/0.3` 融合；
+control 与 LLM augmentation 按完全相同三组权重融合。对 emission、CRF start、
+end、pair transition 一起混合，得到两个完整序列分数的加权和；不投票 BIO 标签，
+不改变结构约束或重新训练。模型逐个前向 validation 后在 CPU 上解码。
+
+首先检查模型配置一致（训练数据/输出路径可不同）、validation SHA256 相同，
+并检查单模型重放等价与已记录 dev F1 的复现。gold 只用于统一的 seqeval 评估和
+互补错误诊断，不进入融合分数、逐样本路由或权重生成。权重集合在评估前固定，
+只在 validation 上选择一次，同时保存所有七项结果与策略的 artifact hash。
+
+新探索只有 LLM 融合超过单独 control 和最好的无 LLM 同规模融合，才观察到
+LLM 的附加收益；打平保留无 LLM 策略。验证集选择不构成独立确认或显著性证据，
+历史 test 多次查看的局限仍保留。不得因普通集成增益而宣称 LLM 有效，也不得
+在 test 上搜索权重。实现见 `scripts/evaluate_crf_ensemble.py`，命令见 README。
+
+## 历史 V6.1：Locked-Entity Multimodal Augmentation
 
 V5.1 的冻结主干和零初始化残差成功排除了继续微调过拟合，但 epoch 0 与后续
 最佳 validation F1 都约为 `0.8179`，未达到 `+0.003` 的预注册门槛。与此同时，
