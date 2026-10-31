@@ -2,7 +2,56 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
-## 当前实验：复用 V6.1 checkpoint 的固定 CRF 分数融合
+## 当前补充实验：LLM 参与选样，还是训练特征重采样？
+
+审查数据构建代码后确认：历史 `duplicate_control` 重复的 344 个 source ID
+来自通过 LLM 生成和规则验证的 accepted 集合，因此其训练数据选择也间接依赖
+LLM。它可以隔离合成文本相对原句的影响，却不是消除了 LLM 选样作用的对照。
+这只是流程依赖，不能据此将系统的提升归因于 LLM，accepted 也不等于已验证
+语义质量。下述角度是既有结果之后提出的**事后假设**，已有结果与负结果保留。
+
+新增对照从相同 1,000 个候选中抽取 344 个原句，候选打分只使用原训练数据：
+精确匹配图片文件名来源域、gold 实体类别存在模式和前四张图片实际可解码数量；
+通过固定 50,000 次组内交换，降低词数、WordPiece 数、实体总数/各类数量及
+粗粒度长度分布的差异。匹配目标分布来自原 accepted-source 重采样组，但
+候选排序不使用 LLM 响应、acceptance、验证集成绩或测试集成绩。
+允许和报告与 accepted 集合重叠，不主动排除它们，也不按训练结果挑选抽样种子。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+mkdir -p logs
+set -o pipefail
+
+python -u scripts/build_matched_resampling_control.py \
+  --input-dir dataset/text \
+  --candidate-metadata augmentation_cache/qwen3vl32b_v61/MNER-UNI_train.jsonl.meta.json \
+  --reference-manifest dataset/v61_duplicate_control_seed20261027/augmentation_manifest.json \
+  --image-root dataset/images \
+  --twitter-image-root dataset/twitter2017_images \
+  --bert-model /root/autodl-tmp/pretrained_models/bert-base-uncased \
+  --sampling-seed 20261031 \
+  --output-dir dataset/v62_feature_matched_seed20261031 \
+  2>&1 | tee logs/v62_build_matched_control.log
+```
+
+此步不需要 GPU 或 API。预期 original=10,229、added=344、total=10,573。
+抽样清单、原始数据/参考臂/候选元数据/图片/输出文件 hash、精确分层配额、
+特征均值、候选池 SD 标准化差异和重叠率记录在
+`dataset/v62_feature_matched_seed20261031/matched_resampling_manifest.json`。
+只有 `ready_for_training=true` 才训练：预设最大标准化差异为 0.10，最大重叠率
+为 0.80。这是匹配与可区分性的工程门槛，不是显著性检验；不满足时保留报告并
+先检查，不根据后续模型成绩改变门槛。
+
+通过后使用 `run.py`，仅更改 data path 为上述目录，输出为
+`outputs_v62/matched_no_llm_seed{seed}`；seed 固定为 1234、42、2026。
+保持此前 lr=5e-5、bert_lr=1e-5、vit_lr=5e-6、epoch=15、batch=4、patience=3
+及其它配置不变，始终 `--skip-test`。与已有 accepted-source 原句重采样组比较
+三个种子的 validation F1：seed 1234 `0.818665`、42 `0.819984`、2026 `0.818218`。
+若匹配重采样即可解释提升，应如实报告；只有超出该对照的收益才进一步支持
+LLM 参与选择有用的假设。新增对照仍是事后探索，不是封存测试的确认性结论，
+也不证明多模态语义质量。此阶段不增加 API 请求，不重跑集成权重搜索。
+
+## 已完成实验：复用 V6.1 checkpoint 的固定 CRF 分数融合
 
 V6.1 的 seed 1234 验证结果为：严格基线 `0.8142`、重复样本对照 `0.8187`、
 LLM 增强 `0.8175`。因此原先要求同时超过两种对照 `0.003` 的单模型实验为
