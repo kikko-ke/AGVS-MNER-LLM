@@ -24,6 +24,15 @@ LLM 的附加收益；打平保留无 LLM 策略。验证集选择不构成独�
 历史 test 多次查看的局限仍保留。不得因普通集成增益而宣称 LLM 有效，也不得
 在 test 上搜索权重。实现见 `scripts/evaluate_crf_ensemble.py`，命令见 README。
 
+七组探索实际结果（seed 1234）：control `0.818665`，最优无 LLM 融合
+`0.7 control + 0.3 baseline = 0.824223`，最优 LLM 融合 `0.821140`。
+故冻结普通融合 `0.7/0.3` 后，只在 seed 42、2026 上训练严格基线与 duplicate
+control，并使用 `scripts/confirm_crf_ensemble.py` 从原 policy JSON 读取固定
+权重评估。此阶段没有权重参数搜索、不需要新 LLM 模型或 API 请求。
+报告每种子的 baseline/control/ensemble F1，以及相对同种子更强单模型的增益。
+确认均值不混入用于选权重的 seed 1234。两个新种子的复现仍使用同一 validation
+划分；不得当作独立数据验证或显著性检验，也不构成 LLM 有效的证据。
+
 ## 历史 V6.1：Locked-Entity Multimodal Augmentation
 
 V5.1 的冻结主干和零初始化残差成功排除了继续微调过拟合，但 epoch 0 与后续

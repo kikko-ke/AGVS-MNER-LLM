@@ -48,6 +48,47 @@ LLM 融合必须超过 control **以及最好的无 LLM 融合**才算观察到�
 不表示显著性或测试集收益。打平时保留无 LLM 方案。只有普通集成改善时不能
 宣称 LLM 有贡献。脚本不支持 test 权重搜索，部署候选最多需要两个模型前向。
 
+### 冻结 0.7/0.3 后的 seed 42、2026 确认
+
+seed 1234 的七组探索已完成：control `0.818665`，普通融合最优为
+`0.7 control + 0.3 baseline = 0.824223`；LLM 融合最优 `0.821140`。
+该结果支持进一步检查普通集成，不支持宣称 LLM 有额外贡献。后续确认固定
+`0.7/0.3`，不再运行七组搜索，也不需要训练两个新种子的 LLM 增强模型。
+
+从头训练 `strict_baseline_seed42`、`duplicate_control_seed42`、
+`strict_baseline_seed2026`、`duplicate_control_seed2026` 后，执行：
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+
+python -u scripts/confirm_crf_ensemble.py \
+  --policy outputs_v61/crf_ensemble_seed1234_20261031_004646/val_metrics.policy.json \
+  --runs-root outputs_v61 \
+  --seeds 42 2026 \
+  --data-path dataset/text \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  --output "outputs_v61/crf_fixed_confirmation_$stamp/val_metrics.json" \
+  2>&1 | tee "logs/v61_crf_fixed_confirmation_$stamp.log"
+
+status=${PIPESTATUS[0]}
+echo "Confirmation exit status: $status"
+```
+
+脚本从原策略文件读取权重、原配置和 validation hash；自动定位每个新种子各臂
+唯一的 checkpoint，若有多个训练目录则报错，避免按验证成绩挑选重复实验。
+同时核验新种子的训练配置（仅允许 seed、数据/输出目录等预期差异）。
+只评估固定权重和两个单模型；每个种子的 `gain_over_best_single` 都相对该种子
+更强的单模型计算，最后报告新种子的平均增益和正增益种子数。seed 1234 不计入
+新的确认均值，因其用于选择权重。这是同一 validation 上的随机种子复现，
+不等于新数据划分上的独立验证、统计显著性或测试集收益。
+
 ## 历史 V6.1：锁定实体的多模态训练增强
 
 V5.1 受保护适配器稳定地保持了强基线，但没有产生有意义的 validation 增益：
