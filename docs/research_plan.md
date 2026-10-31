@@ -33,6 +33,14 @@ control，并使用 `scripts/confirm_crf_ensemble.py` 从原 policy JSON 读取�
 确认均值不混入用于选权重的 seed 1234。两个新种子的复现仍使用同一 validation
 划分；不得当作独立数据验证或显著性检验，也不构成 LLM 有效的证据。
 
+固定权重确认实际结果：seed 42 的 baseline/control/ensemble 分别为
+`0.815851/0.819984/0.821907`；seed 2026 分别为
+`0.819431/0.818218/0.821794`。两种子都超过各自更强的单模型，平均增益
+`0.002143`。因此将普通融合权重冻结，使用 `evaluate_frozen_crf_test.py`
+评估 seed 42、1234、2026 的三个方法。原策略和确认报告通过 SHA256 绑定，
+checkpoint 必须与两阶段既有 hash 一致。完整报告三种子结果、均值和样本标准差，
+不按 test 选择权重、模型或种子。历史 test 已用于早期开发的局限必须披露。
+
 ## 历史 V6.1：Locked-Entity Multimodal Augmentation
 
 V5.1 的冻结主干和零初始化残差成功排除了继续微调过拟合，但 epoch 0 与后续

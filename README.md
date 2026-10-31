@@ -89,6 +89,48 @@ echo "Confirmation exit status: $status"
 新的确认均值，因其用于选择权重。这是同一 validation 上的随机种子复现，
 不等于新数据划分上的独立验证、统计显著性或测试集收益。
 
+### 最终测试：三个种子、固定权重、完整报告
+
+固定 `0.7 control + 0.3 baseline` 在两个新种子的 validation 上已完成复现：
+seed 42 为 `0.821907`（超过同种子最强单模型 `0.001923`），seed 2026 为
+`0.821794`（超过 `0.002363`）。确认平均增益 `0.002143`；这是普通集成的
+种子复现，不构成 LLM 增益证据。接下来冻结上述设置，直接评估已有 checkpoint，
+不重新训练、不在 test 上搜索权重：
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+
+python -u scripts/evaluate_frozen_crf_test.py \
+  --policy outputs_v61/crf_ensemble_seed1234_20261031_004646/val_metrics.policy.json \
+  --confirmation-report outputs_v61/crf_fixed_confirmation_20261031_152544/val_metrics.json \
+  --runs-root outputs_v61 \
+  --seeds 42 1234 2026 \
+  --data-path dataset/text \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  --output "outputs_v61/crf_final_test_$stamp/test_metrics.json" \
+  2>&1 | tee "logs/v61_crf_final_test_$stamp.log"
+
+status=${PIPESTATUS[0]}
+echo "Final evaluation exit status: $status"
+```
+
+原 policy 的 hash 必须与 validation 确认报告一致，六个 checkpoint 必须与
+权重选择/确认时记录的 hash 一致，各数据臂的 val/test 文件也必须分别一致。
+程序完整报告 seed 42、1234、2026 的三个方法，不能只选择表现好的种子。
+报告包含 precision/recall/F1、分类报告、三种子的均值和样本标准差，以及每种子
+融合相对 baseline/control 的配对差值。test F1 不与训练日志中的 dev F1 比较。
+所有结果都报告，不根据 test 结果回调权重或挑选最佳种子。
+
+历史开发已经查看过该数据集的 test，因此最终报告应如实说明开发历史，不能
+将它称为从未使用的独立留出集；种子标准差也不是显著性检验。
+
 ## 历史 V6.1：锁定实体的多模态训练增强
 
 V5.1 受保护适配器稳定地保持了强基线，但没有产生有意义的 validation 增益：
