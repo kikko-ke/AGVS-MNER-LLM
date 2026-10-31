@@ -22,6 +22,25 @@ WordPiece 数、gold 实体计数及粗分箱分布。候选没有 LLM 语义或
 把当前已反复查看的 test 当成独立留出集；若要独立确认，需新划分/外部数据。
 实现：`scripts/build_matched_resampling_control.py`，命令和审计说明见 README。
 
+### 已观察到的验证集差值及下一项比较
+
+2026-10-31 匹配数据审计通过：最大标准化差异 0.007254，参考重叠率 41.57%。
+metrics.csv 的四位小数结果为：seed 1234 的参考/匹配为 0.8187/0.8149，
+42 为 0.8200/0.8145，2026 为 0.8182/0.8171。平均差值约 +0.0035，3/3 为正。
+这涉及同一个固定匹配抽样集合上的三次训练，不是三个独立的选样实验。
+
+在观察上述 validation 结果后，测试补充分析固定全部三个种子的现有 dev-best
+checkpoint，不进一步调参。主比较固定为 accepted-source 原句重采样减去
+feature-matched 原句重采样的单模型 F1；次比较为两臂各自与相同严格基线
+按历史 0.7/0.3 融合的 F1 差值。两项都完整报告，不能按结果替换主比较。
+实现为 `scripts/evaluate_matched_resampling.py`，读取原 final-test 报告绑定的
+policy/confirmation/checkpoint hash，复现旧结果并报告新臂。此时测试结果未知。
+代码测试只验证评估实现，不替代实际模型评估。
+
+LLM 与自动校验器共同决定 acceptance，不能仅凭此实验分离两者作用，也不能
+将 acceptance 解释为真实多模态语义质量。早期 test 已用于开发，当前也是
+事后假设；补充测试不是独立确认，三种子差值不等于显著性结论。
+
 ## 已完成实验：固定七组 CRF 分数融合
 
 V6.1 单模型 pilot 已完成：严格基线 dev F1 `0.8142`、duplicate control

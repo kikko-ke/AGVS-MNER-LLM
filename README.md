@@ -51,6 +51,56 @@ python -u scripts/build_matched_resampling_control.py \
 LLM 参与选择有用的假设。新增对照仍是事后探索，不是封存测试的确认性结论，
 也不证明多模态语义质量。此阶段不增加 API 请求，不重跑集成权重搜索。
 
+### 匹配重采样验证结果与固定测试比较
+
+匹配审计已通过：最大候选池 SD 标准化差异 `0.007254`，源 ID 重叠率
+`41.57%`，两臂均新增 344 条原句。三种子的 validation F1（metrics.csv
+保留四位小数）如下：
+
+| seed | LLM+校验器选样原句重采样 | 特征匹配原句重采样 | 差值 |
+| --- | ---: | ---: | ---: |
+| 1234 | 0.8187 | 0.8149 | +0.0038 |
+| 42 | 0.8200 | 0.8145 | +0.0055 |
+| 2026 | 0.8182 | 0.8171 | +0.0011 |
+
+平均差值约 `+0.0035`（0.35 个 F1 百分点），三个训练种子均为正。这支持继续
+检查联合选样策略，但只使用了一个固定匹配抽样集合，不能声称 LLM 单独的
+因果贡献、视觉语义质量或统计显著性，也不能改写此前文本增强的负结果。
+
+下面固定全部三个种子、各自 dev 选出的 best checkpoint 和此前已冻结的
+`0.7 resampled + 0.3 baseline` 权重。主比较为选样与匹配两臂的单模型差值；
+相同权重下的两种融合差值为次比较。脚本先核验数据/抽样清单、九个模型的
+配置和历史模型 hash，再检验旧单模型和融合的 test P/R/F1 是否精确复现。
+三个新增 matched checkpoint 还须先复现各自 metrics.csv 中的最佳 validation F1。
+完整报告所有种子和两项比较，不搜索权重，不新增训练或 API 请求。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+
+python -u scripts/evaluate_matched_resampling.py \
+  --reference-report outputs_v61/crf_final_test_20261031_155318/test_metrics.json \
+  --matched-manifest dataset/v62_feature_matched_seed20261031/matched_resampling_manifest.json \
+  --matched-runs-root outputs_v62 \
+  --data-path dataset/text \
+  --device cuda \
+  --batch-size 4 \
+  --num-workers 4 \
+  --output "outputs_v62/matched_test_$stamp/test_metrics.json" \
+  2>&1 | tee "logs/v62_matched_test_$stamp.log"
+
+status=${PIPESTATUS[0]}
+echo "Evaluation exit status: $status"
+```
+
+原 test 已在早期项目中多次查看，选样解释也是事后提出；此次测试比较仅作为
+探索性补充证据，不能称为独立确认。脚本在结果中保留这些限制。若两种比较
+结论不同，应分别报告；不能只保留有利的融合或种子。
+
 ## 已完成实验：复用 V6.1 checkpoint 的固定 CRF 分数融合
 
 V6.1 的 seed 1234 验证结果为：严格基线 `0.8142`、重复样本对照 `0.8187`、
