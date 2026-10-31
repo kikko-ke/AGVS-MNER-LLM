@@ -228,6 +228,7 @@ def main() -> None:
             raise ValueError(f"Reference {split} file differs from original")
     manifest = {
         "schema_version": "feature-matched-resampling-v1", "arm": "feature_matched_no_llm",
+        "dataset": cli.dataset,
         "hypothesis_origin": "post-hoc after existing V6.1 results; validation-only exploration",
         "llm_api_requests": 0, "candidate_scoring_uses_llm_outputs": False,
         "reference_distribution_comes_from_llm_and_validator_selection": True,

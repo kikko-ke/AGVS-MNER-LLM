@@ -53,9 +53,10 @@ def require_hash(path: Path, expected: str, description: str) -> None:
         raise ValueError(f"{description} SHA256 changed: {path}")
 
 
-def audit_data(manifest_path: Path, source: Path) -> dict[str, Any]:
+def audit_data(manifest_path: Path, source: Path, dataset: str = "UNI") -> dict[str, Any]:
     manifest = read_json(manifest_path)
     if (manifest.get("schema_version") != "feature-matched-resampling-v1"
+            or dataset not in {"MI", "UNI"} or manifest.get("dataset", "UNI") != dataset
             or manifest.get("arm") != "feature_matched_no_llm"
             or manifest.get("ready_for_training") is not True
             or manifest.get("candidate_scoring_uses_llm_outputs") is not False
@@ -88,10 +89,10 @@ def audit_data(manifest_path: Path, source: Path) -> dict[str, Any]:
             or reference.get("accepted_augmentations") != count
             or reference.get("source_train_sha256") != manifest["source_train_sha256"]):
         raise ValueError("Candidate/reference sampling provenance differs")
-    train_name = "MNER-UNI_train.txt"
+    train_name = f"MNER-{dataset}_train.txt"
     require_hash(source / train_name, manifest["source_train_sha256"], "Original training data")
     require_hash(reference_path.parent / train_name, manifest["reference_train_sha256"], "Reference training data")
-    expected_names = {f"MNER-UNI_{split}.txt" for split in ("train", "val", "test")}
+    expected_names = {f"MNER-{dataset}_{split}.txt" for split in ("train", "val", "test")}
     if set(manifest["output_files_sha256"]) != expected_names:
         raise ValueError("Matched manifest must bind all three data files")
     for name, digest in manifest["output_files_sha256"].items():
@@ -107,7 +108,7 @@ def audit_data(manifest_path: Path, source: Path) -> dict[str, Any]:
         if actual != originals + [originals[i] for i in ids]:
             raise ValueError(f"Resampling file differs from its original-source IDs: {directory}")
         for split in ("val", "test"):
-            name = f"MNER-UNI_{split}.txt"
+            name = f"MNER-{dataset}_{split}.txt"
             require_hash(directory / name, sha256_file(source / name), "Common evaluation data")
     return manifest
 

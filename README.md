@@ -2,6 +2,43 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
+## MNER-MI 补实验：复用缓存准备数据，再运行三组三种子
+
+论文的 `MI` 对应 MNER-MI，`UNI` 对应 MNER-MI-Plus。此前 V6.1/V6.2
+结果属于 UNI。MI 使用独立的原始 split、训练模型、选样清单和报告。
+
+为复用现有生成结果，`project_augmentation_selection.py` 按完整原文、规范化
+gold BIO 和有序图片文件名，将已有 UNI 候选映射到 MI **训练集**；不按行号
+映射。核验原缓存元数据和每条响应，要求原候选已全部处理，保留 accepted、
+abstained、rejected 三种状态，只重复 accepted 对应的 MI 原句。检查 MI train
+及原缓存候选与 MI val/test 的原文+图片重叠；后两者标签不参与检查或选样。
+歧义映射、缓存不匹配或 split 不兼容会终止，不能跳过核验或强行改行号。
+
+MI 候选数和 accepted 数以实际匹配为准，**不是**新生成的 1,000 条或固定
+344 条。MI 候选池是既有 UNI 候选池的精确训练子集，论文必须说明这种复用。
+使用同一投影候选池构建特征匹配对照，沿用固定抽样 seed=20261031、最大
+标准化差异 0.10、最大重叠率 0.80。门槛未通过时保留诊断，不能按模型成绩
+重新挑选抽样集合。全过程没有新 API 请求。
+
+在 AutoDL 项目根目录分两步执行：
+
+```bash
+# 数据准备：可在无卡模式运行，依赖现有数据、缓存和本地 BERT tokenizer。
+bash scripts/train_mi_resampling.sh prepare
+
+# 看到 MI data audit passed 后，在有卡模式进行前台训练。
+bash scripts/train_mi_resampling.sh train
+```
+
+训练固定 seed=1234、42、2026，每个种子依次训练 strict_baseline、llm_selected、
+matched_no_llm，共 9 次。全部 `--dataset MI --skip-test`，超参数沿用 UNI：
+epoch=15、batch=4、patience=3、lr=5e-5、BERT=1e-5、ViT=5e-6，其他配置
+也保持不变。先在验证集比较全部三组，之后再固定模型开展测试比较。
+结果根目录 `outputs_mi_v63`，实时日志 `logs/mi_*_seed*.log`。
+正常结束后生成 `completed.json`，再次执行 train 会核验 checkpoint、配置、
+训练代码和数据 hash 后跳过完成的实验；未完成且非空的目录会保留并停止，
+供检查后处理。不要将本脚本的输出交给仍限定 UNI 的旧 final-test 命令。
+
 ## 当前补充实验：LLM 参与选样，还是训练特征重采样？
 
 审查数据构建代码后确认：历史 `duplicate_control` 重复的 344 个 source ID
@@ -53,7 +90,7 @@ LLM 参与选择有用的假设。新增对照仍是事后探索，不是封存�
 
 ### 匹配重采样验证结果与固定测试比较
 
-匹配审计已通过：最大候选池 SD 标准化差异 `0.007254`，源 ID 重叠率
+UNI 匹配审计已通过：最大候选池 SD 标准化差异 `0.007254`，源 ID 重叠率
 `41.57%`，两臂均新增 344 条原句。三种子的 validation F1（metrics.csv
 保留四位小数）如下：
 
