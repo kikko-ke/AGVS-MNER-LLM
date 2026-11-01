@@ -20,8 +20,8 @@ from modules.trainer import NerTrainer
 LOGGER = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse training configuration from the command line."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the unchanged baseline CLI, also reused by controlled experiments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data-path",
@@ -81,7 +81,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train and select checkpoints on validation data without reading the test split.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def set_seed(seed: int) -> None:

@@ -14,7 +14,28 @@
 [两数据集固定测试记录](docs/component_test_results_20261101.md)。以下保留历史
 实验设计与复现命令，不代表这些候选已经取得了泛化增益。
 
-### 下一步：训练数据分布和验证集逐类诊断
+### 当前开发：已有 LLM 改写的实体一致性小试验
+
+训练分布和逐类诊断已完成：MI 重采样后 MIS 占比约增加 1.02 个百分点，
+但该类 validation F1 下降约 1.19 个百分点；这不支持继续简单增加原句
+重复，也不能仅凭分布统计认定下降原因。
+
+新候选保留 legacy 架构，每个原始训练样本每轮只出现一次；已有 LLM
+改写只用作受保护实体的一致性辅助视图。固定 MI 内部 train/dev 三臂：
+原始训练、相同额外前向预算的 dropout 一致性、LLM 上下文一致性。
+不新生成缓存，不读取官方 val/test。实现尚无性能结果。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+bash scripts/train_context_consistency_pilot.sh
+```
+
+在有 GPU 的实例前台串行训练，日志 `logs/context_internal_*.log`，汇总
+`outputs_context_internal/pilot_*.json`。内部开发 F1 相对两个控制均至少
++0.003 才考虑后续复验，否则停止。此门槛不代表显著性，也不保证实际
+提升。完整假设、控制、局限和输出见 [固定协议](docs/context_consistency_pilot.md)。
+
+### 已完成：训练数据分布和验证集逐类诊断
 
 先使用现有文件做只读分析，不新增训练、模型前向或 LLM 请求：
 
