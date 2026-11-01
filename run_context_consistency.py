@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--consistency-weight", type=float, default=0.5)
     parser.add_argument("--consistency-temperature", type=float, default=2.0)
     parser.add_argument("--consistency-warmup-epochs", type=int, default=2)
+    parser.add_argument("--dropout-selection-manifest")
+    parser.add_argument("--dropout-selection-arm", choices=("llm_selected", "feature_matched"))
     parser.set_defaults(skip_test=True, visual_fusion="legacy")
     return parser.parse_args()
 
@@ -35,6 +37,9 @@ def main():
         raise ValueError("Expected non-negative consistency weight/warmup and positive temperature")
     if not args.skip_test or args.visual_fusion != "legacy":
         raise ValueError("This controlled pilot requires the legacy component and no test evaluation")
+    if (bool(args.dropout_selection_manifest) != bool(args.dropout_selection_arm)
+            or (args.dropout_selection_manifest and args.consistency_mode != "dropout")):
+        raise ValueError("Dropout selection requires both manifest/arm and consistency-mode dropout")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; start with a GPU for this pilot")
     manifest = verify_internal_manifest(args.internal_manifest, args.dataset)
@@ -46,7 +51,13 @@ def main():
     for key, value in vars(args).items():
         logger.info("%s = %s", key, value)
     base = MultimodalNerDataset(args, f"MNER-{args.dataset}_train.txt")
-    train = ContextViewDataset(base, args.internal_manifest, args.augmentation_cache, args.dataset)
+    if args.dropout_selection_manifest:
+        from modules.dropout_selection import DropoutSelectionDataset
+        train = DropoutSelectionDataset(base, args.dropout_selection_manifest, args.dropout_selection_arm,
+                                       args.internal_manifest, args.augmentation_cache, args.dataset, args.bert_model)
+        args.dropout_selection_sha256 = train.summary["cohort_sha256"]
+    else:
+        train = ContextViewDataset(base, args.internal_manifest, args.augmentation_cache, args.dataset)
     dev = MultimodalNerDataset(args, f"MNER-{args.dataset}_val.txt")
     logger.info("Internal context views: %s", json.dumps(train.summary, sort_keys=True))
     # Explicit loader generators also separate shuffle/worker RNG from dropout.
@@ -58,6 +69,15 @@ def main():
     model = AgvsMnerModel(list(labels), args)
     trainer = ContextConsistencyTrainer(train_loader, dev_loader, None, model, labels, args, logger)
     trainer.train()
+    if args.dropout_selection_manifest:
+        from scripts.build_llm_augmentation_cache import sha256_file
+        completed = {"schema_version": "dropout-selection-completed-v1",
+                     "checkpoint_sha256": sha256_file(trainer.checkpoint_path),
+                     "config_sha256": sha256_file(trainer.run_directory / "config.json"),
+                     "cohort_sha256": args.dropout_selection_sha256,
+                     "best_dev_f1": trainer.best_dev_f1, "best_epoch": trainer.best_dev_epoch,
+                     "test_read": False}
+        (trainer.run_directory / "completed.json").write_text(json.dumps(completed, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

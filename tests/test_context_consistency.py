@@ -265,3 +265,110 @@ def test_entrypoint_trains_and_saves_without_loading_any_test_file(tmp_path, mon
     assert config["skip_test"] is True and config["consistency_mode"] == "llm_context"
     assert loaded == ["MNER-MI_train.txt", "MNER-MI_val.txt"]
     assert checkpoints[0].with_name("metrics.csv").is_file()
+
+
+def selection_fixture(tmp_path):
+    from PIL import Image
+    from modules.dropout_selection import prepare_cohorts
+
+    _, path, manifest, cache, cached, base = fixture(tmp_path)
+    selected = set(manifest["partitions"]["train"]["source_ids"][:4])
+    for row in cached:
+        if row["sample_id"] not in selected:
+            row["status"] = "rejected"
+    cache.write_text("".join(json.dumps(row) + "\n" for row in cached), encoding="utf-8")
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.jpg")
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    (tokenizer / "vocab.txt").write_text("fixture vocabulary", encoding="utf-8")
+    cohort = prepare_cohorts(base, path, cache, "MI", tmp_path, tmp_path, tokenizer)
+    cohort_path = tmp_path / "cohorts.json"
+    cohort_path.write_text(json.dumps(cohort), encoding="utf-8")
+    return path, manifest, cache, base, tokenizer, cohort_path, cohort
+
+
+def test_dropout_cohorts_match_training_features_and_use_only_source_entities(tmp_path):
+    from modules.dropout_selection import ARMS, DropoutSelectionDataset
+
+    path, manifest, cache, base, tokenizer, cohort_path, cohort = selection_fixture(tmp_path)
+    assert cohort["ready_for_training"] is True
+    assert cohort["balance_check"]["maximum"] == 0
+    assert cohort["eligible_per_arm"] == 4 and cohort["official_val_or_test_read"] is False
+    dev_ids = set(manifest["partitions"]["dev"]["source_ids"])
+    for arm in ARMS:
+        assert len(set(cohort["arms"][arm]["source_ids"])) == 4
+        assert not set(cohort["arms"][arm]["source_ids"]) & dev_ids
+        dataset = DropoutSelectionDataset(base, cohort_path, arm, path, cache, "MI", tokenizer)
+        assert len(dataset) == len(base)
+        for i in range(len(dataset)):
+            row = dataset[i]
+            assert all(torch.equal(a, b) for a, b in zip(row[:6], base[i]))
+            assert torch.equal(row[0], row[6]) and torch.equal(row[9], row[10])
+        assert sum(float(dataset[i][-1].sum()) for i in range(len(dataset))) == 4
+
+
+@pytest.mark.parametrize("changed", ["cache", "tokenizer", "image", "dev_id", "positions"])
+def test_dropout_cohort_bindings_reject_changed_inputs_or_heldout_ids(tmp_path, changed):
+    from modules.dropout_selection import DropoutSelectionDataset
+
+    path, manifest, cache, base, tokenizer, cohort_path, cohort = selection_fixture(tmp_path)
+    if changed == "cache":
+        cache.write_text(cache.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    elif changed == "tokenizer":
+        (tokenizer / "vocab.txt").write_text("changed", encoding="utf-8")
+    elif changed == "image":
+        (tmp_path / "a.jpg").write_bytes(b"changed")
+    elif changed == "dev_id":
+        cohort["arms"]["llm_selected"]["source_ids"][0] = manifest["partitions"]["dev"]["source_ids"][0]
+    else:
+        first = cohort["arms"]["llm_selected"]["source_ids"][0]
+        cohort["arms"]["llm_selected"]["source_alignments"][str(first)]["positions"] = [0]
+    cohort_path.write_text(json.dumps(cohort), encoding="utf-8")
+    with pytest.raises(ValueError):
+        DropoutSelectionDataset(base, cohort_path, "llm_selected", path, cache, "MI", tokenizer)
+
+
+def test_dropout_cohort_full_overlap_blocks_training(tmp_path):
+    from modules.dropout_selection import prepare_cohorts
+
+    _, path, _, cache, _, base = fixture(tmp_path)
+    from PIL import Image
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.jpg")
+    cohort = prepare_cohorts(base, path, cache, "MI", tmp_path, tmp_path, tmp_path)
+    assert cohort["overlap_check"]["fraction"] == 1
+    assert cohort["ready_for_training"] is False
+
+
+def test_dropout_selection_entrypoint_saves_completed_binding(tmp_path, monkeypatch):
+    import run_context_consistency as entry
+    from scripts.evaluate_dropout_selection import completed_run
+    from modules.dropout_selection import FIXED_TRAINING
+
+    path, _, cache, _, tokenizer, cohort_path, _ = selection_fixture(tmp_path)
+    monkeypatch.setattr(entry, "MultimodalNerDataset", lambda args, filename: FakeBase(Path(args.data_path) / filename))
+    monkeypatch.setattr(entry, "AgvsMnerModel", lambda labels, args: TinyModel())
+    monkeypatch.setattr(entry, "configure_logging", lambda output: None)
+    root = tmp_path / "outputs"
+    monkeypatch.setattr("sys.argv", ["run_context_consistency.py", "--dataset", "MI", "--device", "cpu",
+        "--data-path", str(path.parent), "--internal-manifest", str(path), "--augmentation-cache", str(cache),
+        "--consistency-mode", "dropout", "--dropout-selection-manifest", str(cohort_path),
+        "--dropout-selection-arm", "llm_selected", "--bert-model", str(tokenizer),
+        "--num-epochs", "1", "--batch-size", "32", "--output-dir", str(root / "llm_selected_seed1234")])
+    entry.main()
+    checkpoint = list(root.glob("*/*/best_model.pt"))[0]
+    completed = json.loads(checkpoint.with_name("completed.json").read_text(encoding="utf-8"))
+    assert completed["checkpoint_sha256"] == sha256_file(checkpoint)
+    assert completed["test_read"] is False
+    # The production reader must reject our deliberately non-protocol smoke run.
+    with pytest.raises(ValueError, match="fixed dropout selection protocol"):
+        completed_run(root, "llm_selected", cohort_path)
+    config_path = checkpoint.with_name("config.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(FIXED_TRAINING)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    completed["config_sha256"] = sha256_file(config_path)
+    checkpoint.with_name("completed.json").write_text(json.dumps(completed), encoding="utf-8")
+    assert completed_run(root, "llm_selected", cohort_path)[0] == checkpoint
+    checkpoint.write_bytes(b"changed checkpoint")
+    with pytest.raises(ValueError, match="binding changed"):
+        completed_run(root, "llm_selected", cohort_path)

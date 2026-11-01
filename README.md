@@ -14,7 +14,25 @@
 [两数据集固定测试记录](docs/component_test_results_20261101.md)。以下保留历史
 实验设计与复现命令，不代表这些候选已经取得了泛化增益。
 
-### 当前开发：已有 LLM 改写的实体一致性小试验
+### 当前开发：固定 Dropout 一致性的选样对照
+
+上一轮 MI 内部开发：原始训练 0.8050、Dropout 一致性 0.8111、LLM 改写
+一致性 0.8103。改写没有通过相对两个控制的继续门槛，该路线停止。
+Dropout 组仍使用联合筛选的 179 条源样本；下一探索仅比较同一种原句
+Dropout 一致性训练中的联合选样与特征匹配选样，不生成缓存，不读官方
+val/test。两组统一为原句完整实体位置，所以都重新训练，旧 0.8111 不直接
+充当新对照。尚无新选样对照的训练成绩。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+bash scripts/train_dropout_selection_pilot.sh
+```
+
+匹配门槛通过后前台串行两组，自动验证并汇总到
+`outputs_dropout_selection_internal/selection_pilot_*.json`。
+固定配置、匹配与停止标准见 [选样对照协议](docs/dropout_selection_pilot.md)。
+
+### 已完成：已有 LLM 改写的实体一致性小试验
 
 训练分布和逐类诊断已完成：MI 重采样后 MIS 占比约增加 1.02 个百分点，
 但该类 validation F1 下降约 1.19 个百分点；这不支持继续简单增加原句

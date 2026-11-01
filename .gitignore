@@ -17,6 +17,7 @@ outputs/
 outputs_llm/
 outputs_atomic/
 outputs_context_internal/
+outputs_dropout_selection_internal/
 teacher_cache/
 rerank_cache/
 atomic_cache/
