@@ -14,6 +14,34 @@
 [两数据集固定测试记录](docs/component_test_results_20261101.md)。以下保留历史
 实验设计与复现命令，不代表这些候选已经取得了泛化增益。
 
+### 下一步：训练数据分布和验证集逐类诊断
+
+先使用现有文件做只读分析，不新增训练、模型前向或 LLM 请求：
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+python -u scripts/audit_resampling_development.py \
+  --suite-dir outputs_component_v1/fixed_suite_20261101_180048 \
+  --output "outputs_component_v1/development_audit_$stamp.json" \
+  2>&1 | tee "logs/development_audit_$stamp.log"
+```
+
+该脚本仅依赖 Python 标准库，可无卡运行。它读取绑定的 frozen manifest、
+validation_metrics、原训练集和选样/匹配清单，核验来源与原句重复内容；不
+读取 test_metrics 或原始 test 样本。输出原训练集、候选池、accepted 源、
+matched 源及两种实际训练分布的实体占比、原词长度、文件名来源域、实体
+surface 集中度，并汇总三种子 validation 的逐类 P/R/F1 与选样差值。
+
+原训练分布为 WordPiece 截断前统计，图片数仅统计列出的文件名，不冒充
+可解码图片数；不能直接与截断后的 validation support 相等对照。分布差异
+只是待验证假设，不能据此断言导致了测试下降。surface 集中度受组大小影响，
+应优先比较同规模 accepted/matched，不能单凭 top10 指标认定偏差。
+诊断不自动选择模型或权重；
+后续方法开发需另行固定训练侧内部开发协议，历史 test 的局限仍保留。
+
 ## 固定两数据集、三种子、四组模型的测试报告
 
 组件三种子 validation 已完成。按 CSV 四位小数汇总，MI 的旧选样/新组件
