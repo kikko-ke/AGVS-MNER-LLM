@@ -2,6 +2,47 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
+## 固定两数据集、三种子、四组模型的测试报告
+
+组件三种子 validation 已完成。按 CSV 四位小数汇总，MI 的旧选样/新组件
+选样均值分别为 0.78010/0.77943，差值约 -0.00067；UNI 分别为
+0.81897/0.82163，差值约 +0.00267。MI 的 seed2026 回退须保留，不能把
+新组件表述为跨数据集稳定改进。原组件+联合选样作为两套数据集的共同候选，
+新组件仍作为单独消融，固定配置后完整报告测试，不按 test 选择组件开关。
+
+`evaluate_component_suite.py` 固定 MI、UNI 和种子 42/1234/2026，报告四组：
+严格基线、原组件联合选样重采样、原组件特征匹配重采样、新组件联合选样。
+共 24 个既有 checkpoint，全部先在 validation 前向并核验 metrics.csv 中的
+最佳 dev F1。训练配置只允许组件、训练数据路径和种子等声明的差别，数据
+构造清单、原句重采样内容和各臂 val/test 文件也需通过校验。
+
+所有模型/config/CSV、数据和评估代码 hash 在测试之前记录；validation
+核验失败时不会进入 test。测试不与 dev 分数比较，不训练、不重排、不搜索
+权重。完整输出每个种子与每组的 P/R/F1、分类报告、均值、样本标准差及
+三种配对差值，不选择最有利模型或种子。每次顺序只加载一个模型。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p logs
+stamp=$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+
+python -u scripts/evaluate_component_suite.py \
+  --device cuda --batch-size 4 --num-workers 4 \
+  --output-dir "outputs_component_v1/fixed_suite_$stamp" \
+  2>&1 | tee "logs/component_fixed_suite_$stamp.log"
+
+status=${PIPESTATUS[0]}
+echo "Evaluation exit status: $status"
+```
+
+同目录生成 `frozen_manifest.json`、`validation_metrics.json`、`test_metrics.json`。
+输出目录已存在时不覆盖，模型/数据/代码发生变化时终止。此前 UNI test 已用于
+开发，当前为事后补充报告，不宣称独立确认或统计显著性。新组件没有同架构
+的特征匹配组，因此不能用其与旧匹配组的差距分离 LLM 的独立贡献。
+
 ## 新组件开发实验：词级 patch 检索与视觉空证据
 
 2026-11-01 的 MI 三种子 validation 均值为：严格基线 0.7788、联合选样

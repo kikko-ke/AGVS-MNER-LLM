@@ -1,5 +1,24 @@
 # 研究计划：选样作用的事后匹配重采样对照
 
+## 2026-11-01 冻结既有模型的完整测试比较
+
+新组件三种子 validation 已收齐：MI 选样组 0.7806/0.7810/0.7767
+（seed1234/42/2026），均值约 0.77943；原组件选样 0.78010。UNI 新组件
+0.8203/0.8219/0.8227，均值约 0.82163；原组件选样约 0.81897。MI 没有
+平均增益，UNI 三种子差值为正。不能把这版组件追认为两数据集统一提升。
+
+下一步冻结当前模型，不再按 test 调组件。原组件+联合选样作为共同候选，
+新组件作为消融，两数据集都完整报告 baseline、legacy_selected、legacy_matched、
+token_selected 四组与 42/1234/2026 三个种子。先前向复现全部 24 个模型的
+dev-best F1 并绑定 checkpoint、config、CSV、数据和评估代码 hash，再用同一
+组模型评估 test。原组件的选样-baseline、选样-matched 和同选样数据下的组件
+差值分别报告，不按测试结果选臂、换种子或搜索融合。没有新增训练或 API 请求。
+
+实现 scripts/evaluate_component_suite.py，单命令产生 frozen_manifest.json、
+validation_metrics.json 和 test_metrics.json。新组件还没有同架构 matched 组，
+不能声称其成绩已单独证明 LLM 因果效应。历史 UNI test 多次查看和当前事后
+假设的局限保留，三训练种子的标准差不等同于显著性检验。
+
 ## 2026-11-01 新组件开发：词级证据检索与空视觉项
 
 MI 已完成三种子 validation，严格基线/联合选样/特征匹配均值分别为
