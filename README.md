@@ -2,6 +2,49 @@
 
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
+## 新组件开发实验：词级 patch 检索与视觉空证据
+
+2026-11-01 的 MI 三种子 validation 均值为：严格基线 0.7788、联合选样
+0.7801、特征匹配 0.7765。联合选样相对基线约 +0.0013，未形成较大的收益。
+下面单独开发学生模型组件，不预先宣称任何新 F1 或 LLM 因果贡献。
+
+代码检查发现，旧模型让所有文本位置共享句子级 top-12 patch，并用有效图片
+数量/4 线性缩放视觉分支。新增 `--visual-fusion token_evidence` 替换检索与
+融合部分：每个文本位置以自身 BERT 表示计算 patch 检索评分，全球视觉锚点
+提供 prior；每个词取自己的 top-12，再与可学习分数、固定零值的 NONE 项一起
+归一化，并由文本和实际聚合视觉上下文生成向量门。检索的 selected scores
+参与 softmax，因此 query/key 不会因只有不可导 top-k 索引而失去梯度。
+新路径只按是否有图决定视觉分支可用性，保留原 image dropout，不将单图
+样本机械缩为四分之一。实际缺失图片被屏蔽，全无图片时视觉增量严格为零。
+
+保留 image CLS 顺序编码、全局锚点、BERT/ViT 和 CRF。默认 `legacy` 路径
+和旧 checkpoint 的数值结构保留；新增参数初始化不推进 shared/sampler RNG。
+新模式有新增必需权重，须从头训练，不允许把旧模型静默当成训练好的新组件。
+当前只为监督/离线选样入口 run.py 开放该模式；旧 grounding/evidence 辅助头
+与之混用会报错，避免把多个实验同时引入。
+
+固定组件设置为 retrieval_size=256、temperature=0.1、anchor_weight=0.25、
+gate bias=-2、context dropout=0.1。不扫超参数，也不新增 LLM/API 请求。
+先对两个数据集分别进行 seed=1234 的二乘二比较，复用旧 legacy 结果：
+
+| 模型组件 | 原训练集 | 已有 LLM+校验器选样的原句重采样 |
+| --- | --- | --- |
+| legacy | 已完成 checkpoint/validation CSV | 已完成 checkpoint/validation CSV |
+| token_evidence | 新训练一次 | 新训练一次 |
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+# 每条命令前台串行训练两次，固定原超参数及 --skip-test。
+bash scripts/train_token_evidence_pilot.sh MI
+bash scripts/train_token_evidence_pilot.sh UNI
+```
+
+结果保存在 `outputs_component_v1`，实时日志为 `logs/component_v1_*`。
+汇总分别报告同数据下的组件差值，以及新组件内 selected-original 的选样
+差值。CSV 分数保留四位小数，尚不是精确前向复现或测试成绩。只有组件收益
+通过验证后再冻结设置、补 42/2026 和同架构的特征匹配对照；不能把组件
+提升全部归因于 LLM。新组件尚无 AutoDL 实测成绩，单元测试只验证实现。
+
 ## MNER-MI 补实验：复用缓存准备数据，再运行三组三种子
 
 论文的 `MI` 对应 MNER-MI，`UNI` 对应 MNER-MI-Plus。此前 V6.1/V6.2

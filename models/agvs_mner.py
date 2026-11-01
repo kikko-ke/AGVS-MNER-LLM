@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from transformers import BertModel, ViTModel
 from torchcrf import CRF
+from models.token_evidence_fusion import TokenEvidenceFusion
 
 from modules.evidence_distillation import (
     evidence_adapter_distillation_loss,
@@ -270,7 +271,7 @@ class RelativePositionTransformerEncoderLayer(nn.Module):
 
 
 class AgvsMnerModel(nn.Module):
-    """AGVS-MNER with the original numerical architecture and parameter order."""
+    """AGVS-MNER with a preserved legacy path and optional token evidence fusion."""
     def __init__(self, label_list, args):
         super().__init__()
         self.args = args
@@ -280,6 +281,9 @@ class AgvsMnerModel(nn.Module):
         self.num_patches_per_image = 196
         self.topk_img_patches = getattr(args, "topk_img_patches", 12)
         self.image_dropout_prob = getattr(args, "image_dropout_prob", 0.2)
+        self.visual_fusion = getattr(args, "visual_fusion", "legacy")
+        if self.visual_fusion not in {"legacy", "token_evidence"}:
+            raise ValueError("visual_fusion must be legacy or token_evidence")
         self.llm_token_loss_weight = getattr(args, "llm_token_loss_weight", 0.0)
         self.llm_image_loss_weight = getattr(args, "llm_image_loss_weight", 0.0)
         self.llm_grounding_loss_weight = getattr(args, "llm_grounding_loss_weight", 0.0)
@@ -313,6 +317,10 @@ class AgvsMnerModel(nn.Module):
             getattr(args, "llm_evidence_adapter_l2_weight", 0.0)
         )
         self.subword_label_id = label_list.index("X") if "X" in label_list else None
+        if self.visual_fusion == "token_evidence" and (
+            self.llm_grounding_loss_weight > 0 or self.llm_evidence_loss_weight > 0 or self.llm_utility_gate
+        ):
+            raise ValueError("token_evidence uses supervised/offline-resampling training; disable legacy auxiliary heads")
 
         # Text encoder
         self.bert = BertModel.from_pretrained(args.bert_model)
@@ -458,6 +466,14 @@ class AgvsMnerModel(nn.Module):
             nn.init.zeros_(self.evidence_adapter_classifier.bias)
         finally:
             torch.set_rng_state(cpu_rng_state)
+
+        self.token_evidence_fusion = None
+        if self.visual_fusion == "token_evidence":
+            # Preserve shared-parameter initialization and the initial sampler RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.token_evidence_fusion = TokenEvidenceFusion(
+                    hidden_size=self.hidden_size, topk=self.topk_img_patches,
+                )
 
     @property
     def slot_embedding(self):
@@ -699,67 +715,77 @@ class AgvsMnerModel(nn.Module):
             torch.finfo(global_scores.dtype).min
         )
 
-        topk = min(self.topk_img_patches, global_scores.size(-1))
-        _, topk_indices = torch.topk(global_scores, k=topk, dim=-1)
+        visual_diagnostics = None
+        if self.visual_fusion == "token_evidence":
+            # Use actual images, never the legacy safe placeholder, as evidence.
+            actual_patch_mask = image_mask_bool.repeat_interleave(self.num_patches_per_image, dim=1)
+            cv, visual_diagnostics = self.token_evidence_fusion(
+                text_seq, gated_patches, actual_patch_mask, global_scores, attention_mask_bool,
+            )
+            # The new module already applies its context-conditioned vector gate.
+            gate = torch.ones_like(cv)
+        else:
+            topk = min(self.topk_img_patches, global_scores.size(-1))
+            _, topk_indices = torch.topk(global_scores, k=topk, dim=-1)
 
-        batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1)
-        selected_patches = gated_patches[batch_indices, topk_indices]
+            batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1)
+            selected_patches = gated_patches[batch_indices, topk_indices]
 
-        image_tokens = torch.cat(
-            [V_global.unsqueeze(1), selected_patches],
-            dim=1
-        )
-
-        patch_img_ids = topk_indices // self.num_patches_per_image
-        selected_patch_mask = safe_image_mask[batch_indices, patch_img_ids]
-
-        image_tokens_mask = torch.cat([
-            torch.ones(batch_size, 1, dtype=torch.bool, device=device),
-            selected_patch_mask
-        ], dim=1)
-
-        selected_image_key_padding_mask = ~image_tokens_mask
-
-        # -----------------------------
-        # 6. Cross-modal attention
-        # -----------------------------
-        cv, _ = self.cross_modal_attention(
-            query=text_seq,
-            key=image_tokens,
-            value=image_tokens,
-            key_padding_mask=selected_image_key_padding_mask
-        )
-        if grounding_visual_context is not None and self.llm_grounding_fusion:
-            cv = cv + torch.tanh(
-                self.grounding_fusion_scale
-            ) * grounding_visual_context
-        if (
-            grounding_probabilities is not None
-            and self.llm_utility_gate
-            and self.llm_utility_gate_active
-        ):
-            cv = _apply_visual_utility_gate(
-                cv,
-                grounding_probabilities,
-                self.utility_gate_scale,
+            image_tokens = torch.cat(
+                [V_global.unsqueeze(1), selected_patches],
+                dim=1
             )
 
-        # -----------------------------
-        # 7. Vector gating fusion
-        # -----------------------------
-        V_global_expanded = V_global.unsqueeze(1).expand(
-            -1,
-            text_seq.size(1),
-            -1
-        )
+            patch_img_ids = topk_indices // self.num_patches_per_image
+            selected_patch_mask = safe_image_mask[batch_indices, patch_img_ids]
 
-        gate_input = torch.cat([text_seq, V_global_expanded], dim=-1)
-        gate = torch.sigmoid(self.img_gate(gate_input))
+            image_tokens_mask = torch.cat([
+                torch.ones(batch_size, 1, dtype=torch.bool, device=device),
+                selected_patch_mask
+            ], dim=1)
+
+            selected_image_key_padding_mask = ~image_tokens_mask
+
+            # 6. Legacy cross-modal attention.
+            cv, _ = self.cross_modal_attention(
+                query=text_seq,
+                key=image_tokens,
+                value=image_tokens,
+                key_padding_mask=selected_image_key_padding_mask
+            )
+            if grounding_visual_context is not None and self.llm_grounding_fusion:
+                cv = cv + torch.tanh(
+                    self.grounding_fusion_scale
+                ) * grounding_visual_context
+            if (
+                grounding_probabilities is not None
+                and self.llm_utility_gate
+                and self.llm_utility_gate_active
+            ):
+                cv = _apply_visual_utility_gate(
+                    cv,
+                    grounding_probabilities,
+                    self.utility_gate_scale,
+                )
+
+            # 7. Legacy global-context vector gate.
+            V_global_expanded = V_global.unsqueeze(1).expand(
+                -1,
+                text_seq.size(1),
+                -1
+            )
+            gate_input = torch.cat([text_seq, V_global_expanded], dim=-1)
+            gate = torch.sigmoid(self.img_gate(gate_input))
 
         if visual_strength_override is None:
-            visual_strength = (
-                real_image_count / float(self.num_images)
-            ).unsqueeze(-1)
+            if self.visual_fusion == "token_evidence":
+                # Evidence strength depends on the token posterior/gate, not
+                # how many of the four padding slots happen to be filled.
+                visual_strength = real_image_count.gt(0).to(text_seq.dtype).unsqueeze(-1)
+            else:
+                visual_strength = (
+                    real_image_count / float(self.num_images)
+                ).unsqueeze(-1)
         else:
             visual_strength = torch.as_tensor(
                 visual_strength_override,
@@ -821,6 +847,13 @@ class AgvsMnerModel(nn.Module):
             )
             total_loss = ner_loss
             loss_components = {"ner": ner_loss.detach()}
+            if visual_diagnostics is not None:
+                count = attention_mask_bool.sum().clamp_min(1)
+                for name, key in (("visual_null_probability", "null_probability"),
+                                  ("visual_gate_mean", "gate_mean")):
+                    loss_components[name] = (
+                        visual_diagnostics[key].detach() * attention_mask_bool
+                    ).sum() / count
             if evidence_adapter_delta is not None:
                 valid_delta = evidence_adapter_delta * attention_mask.unsqueeze(
                     -1

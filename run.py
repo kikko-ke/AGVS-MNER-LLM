@@ -73,6 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-dropout-prob", "--image_dropout_prob", default=0.2, type=float)
     parser.add_argument("--output-dropout", "--output_dropout", default=0.2, type=float)
     parser.add_argument(
+        "--visual-fusion", choices=("legacy", "token_evidence"), default="legacy",
+        help="Legacy shared patch selection, or token-specific patch retrieval with a visual null.",
+    )
+    parser.add_argument(
         "--skip-test",
         action="store_true",
         help="Train and select checkpoints on validation data without reading the test split.",
