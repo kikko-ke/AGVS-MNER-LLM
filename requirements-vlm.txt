@@ -1,0 +1,12 @@
+# Isolated Python 3.11 environment; PyTorch CUDA wheels are installed separately.
+transformers==4.51.3
+tokenizers==0.21.1
+peft==0.15.2
+accelerate==1.6.0
+bitsandbytes==0.45.5
+huggingface-hub==0.30.2
+safetensors==0.5.3
+numpy==1.26.4
+pillow==11.2.1
+tqdm==4.67.1
+pytest==8.3.5

@@ -18,6 +18,7 @@ outputs_llm/
 outputs_atomic/
 outputs_context_internal/
 outputs_dropout_selection_internal/
+outputs_vlm_gold/
 teacher_cache/
 rerank_cache/
 atomic_cache/

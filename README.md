@@ -14,14 +14,35 @@
 [两数据集固定测试记录](docs/component_test_results_20261101.md)。以下保留历史
 实验设计与复现命令，不代表这些候选已经取得了泛化增益。
 
-### 当前开发：固定 Dropout 一致性的选样对照
+### 当前开发：金标准直接监督的多模态 LLM（先 GPU 冒烟）
+
+旧辅助路线已结束。当前实现用原训练标注直接监督 Qwen2.5-VL-3B，
+4-bit QLoRA、冻结视觉、batch1，面向用户的24GB RTX4090D。无需再生成
+教师缓存。旧 BERT 环境保留，另建固定版本的 Python3.11 环境。
+尚无实际 GPU 冒烟结果或性能成绩，不能承诺显存或 F1。
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+bash scripts/setup_vlm_qlora_env.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate /root/autodl-tmp/envs/mner-vlm
+bash scripts/vlm_ner_pilot.sh smoke
+```
+
+先只做8次真实梯度更新与生成检查，报告在
+`outputs_vlm_gold/mi_multi_image_smoke/smoke_report.json`，不会自动长训练。
+完整数据/评估口径、依赖、阶段与局限见 [直接监督基线协议](docs/vlm_direct_sft.md)。
+
+### 已停止：固定 Dropout 一致性的选样对照
 
 上一轮 MI 内部开发：原始训练 0.8050、Dropout 一致性 0.8111、LLM 改写
 一致性 0.8103。改写没有通过相对两个控制的继续门槛，该路线停止。
 Dropout 组仍使用联合筛选的 179 条源样本；下一探索仅比较同一种原句
 Dropout 一致性训练中的联合选样与特征匹配选样，不生成缓存，不读官方
 val/test。两组统一为原句完整实体位置，所以都重新训练，旧 0.8111 不直接
-充当新对照。尚无新选样对照的训练成绩。
+充当新对照。最终内部开发结果：联合选样0.808046，特征匹配0.807335，
+差值+0.000711，未通过+0.003继续门槛，该候选已停止。
 
 ```bash
 cd /root/autodl-tmp/AGVS-MNER-LLM
