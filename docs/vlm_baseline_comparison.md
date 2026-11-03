@@ -91,3 +91,49 @@ python -u scripts/evaluate_baseline_fullwords.py --checkpoint /原none臂/best_m
 不覆盖已有输出。成功后先判断现有QLoRA相对于基线的实际结果，再固定独立
 文本QLoRA对照的训练协议；推理时给多图adapter去图只是输入消融，不等同
 独立训练的文本控制。
+
+## 离线错误对照
+
+已实现 `scripts/audit_baseline_qlora_errors.py`，使用上述两个评估目录中的
+逐条预测和同一prepared manifest。在当前 `mner-vlm` 或原base环境均可执行，
+只依赖标准库及项目的纯Python评分函数，不导入Torch、Transformers、PEFT、
+Pillow，不读取模型权重或图片，不产生GPU前向、训练或API请求：
+
+```bash
+python -u scripts/audit_baseline_qlora_errors.py
+```
+
+先核对source_id集合、prepared数据和已有QLoRA预测hash、所用评分实现，
+再从原始响应严格解析并复算两模型在三个范围内的全部指标。baseline预测
+没有被旧comparison报告直接绑定hash，因此本次核对其全部指标和原词可见
+位置，并新增SHA256记录；不能把它表述成已经恢复了缺失的历史hash证明。
+
+每个范围和LOC/MIS/ORG/PER分别记录七组互斥的实体集合：
+
+| 字段 | 含义 |
+| --- | --- |
+| common_tp | 两模型都识别正确的gold实体 |
+| recovered_gold | QLoRA识别正确、基线漏掉的gold实体 |
+| lost_gold | 基线识别正确、QLoRA漏掉的gold实体 |
+| both_missed_gold | 两模型都漏掉的gold实体 |
+| shared_fp | 两模型共有的误报 |
+| removed_baseline_fp | 换成QLoRA后消失的基线误报 |
+| introduced_vlm_fp | QLoRA新增的误报 |
+
+按实体集合核对TP、FP、FN守恒；不以样本F1平均替代实体micro F1。
+同一条样本可能既补对实体又破坏其他实体，所以还单列两模型均全对、
+仅基线全对、仅QLoRA全对、两者同错及异错的样本数。格式失败仍按空预测
+参与实体计分，另保留失败标记；空gold样本的实体集合可能恰好为空而格式
+仍错误，报告同时保留这两种信息。
+
+输出到新的 `outputs_vlm_gold/baseline_qlora_error_audit/`：
+
+- `error_audit_report.json`：三个范围的逐类差值、七组实体计数和样本结局。
+- `by_type.csv`：三个范围共12行类别统计，便于比较哪一类贡献下降。
+- `error_cases.jsonl`：全部样本的原词、gold、两个模型预测、实体变化及QLoRA原响应。
+- `review_cases.jsonl`：固定seed20261103，按六种错误变化类别各取最多8个
+  非面板案例，去重并标注所属类别，不按错误严重程度挑选。
+
+该分析使用gold，属于诊断，不能将这些集合直接当作推理编辑策略或融合收益。
+当前只判断互补错误的结构和数量，不搜索新阈值，不从dev拟合选择器，
+不追加训练。原始预测、报告和训练文件保持不变；已有审计目录不会覆盖。
