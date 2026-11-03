@@ -58,6 +58,34 @@ PEFT0.15.2 / accelerate1.6.0 / bitsandbytes0.45.5，见 requirements-vlm.txt。
 
 ## 执行阶段
 
+如果安装前数据盘不足20GiB，先查看 `df -h /root /root/autodl-tmp`。
+可以用下述工具将旧实验权重迁移到系统盘；无需GPU，不删除回收站、数据、
+缓存、CSV、配置或日志。默认只打印计划，不修改文件：
+
+```bash
+python -u scripts/relocate_old_checkpoints.py
+# 计划通过且路径符合预期后执行；请先结束正在写入旧权重的训练进程。
+python -u scripts/relocate_old_checkpoints.py --apply
+df -h /root /root/autodl-tmp
+```
+
+工具只选择 `outputs_baseline`、`outputs_llm`、`outputs_atomic`、
+`outputs_context_internal/llm_context_seed1234`、
+`outputs_dropout_selection_internal`、`outputs_component_v1` 中的旧
+`best_model.pt`，按此顺序迁移至 `/root/mner_checkpoint_archive`，
+达到20.5GiB剩余空间即停止。`outputs_v61`、`outputs_v62`、
+`outputs_mi_v63`、`outputs_baseline_fixed` 和其他内部对照权重不在候选范围。
+仅当系统盘与数据盘属于不同文件系统、且系统盘有容纳全部选定权重及
+2GiB余量的空间时执行；否则在任何迁移之前停止，不能绕过空间检查。
+逐文件复制、SHA256校验后，才以符号链接原子替换原权重路径；中断可重跑，
+同名不同内容的归档文件不会被覆盖。空间估计受底层文件系统影响，安装前
+仍以实际 `df` 和安装器检查为准。
+
+**系统盘归档不是异机备份。原路径依赖归档目录；换实例、重装、释放主机或
+打包旧实验时必须一同保留归档。** 需要原始独立文件的严格路径审计前，
+应恢复为普通文件；不能仅复制符号链接。系统盘空间不足时先备份到其他
+存储或扩容，再继续安装，不自动删实验权重。
+
 在 AutoDL 项目根目录依次执行：
 
 ```bash

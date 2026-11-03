@@ -21,6 +21,11 @@
 教师缓存。旧 BERT 环境保留，另建固定版本的 Python3.11 环境。
 尚无实际 GPU 冒烟结果或性能成绩，不能承诺显存或 F1。
 
+安装器要求数据盘至少20GiB可用。空间不足可先运行
+`python scripts/relocate_old_checkpoints.py` 查看旧权重迁移计划；它检查系统盘
+容量及文件系统，显式加 `--apply` 后才复制、校验并将原路径换成链接。
+归档目录必须随实例保留，具体范围及操作见 [磁盘与安装步骤](docs/vlm_direct_sft.md#执行阶段)。
+
 ```bash
 cd /root/autodl-tmp/AGVS-MNER-LLM
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
