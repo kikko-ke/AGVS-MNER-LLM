@@ -183,8 +183,8 @@ python -u scripts/audit_mis_errors.py
 
 每个范围分别统计两模型全部MIS FN/FP、QLoRA丢失/补对的MIS、引入/消除
 的MIS FP，以及共同漏检和共同FP。每个计数必须还原前一步相应MIS总数。
-完整dev的MIS gold共411个，QLoRA丢失66、补对42、共同漏检106；这些只是
-已回传的集合计数，具体的关系分类结果仍待服务器运行。
+完整dev的MIS gold共411个，QLoRA丢失66、补对42、共同漏检106。
+服务器已于2026-11-04回传关系分类结果，见下文。
 
 输出目录 `outputs_vlm_gold/mis_error_diagnosis/` 包含：
 
@@ -196,3 +196,86 @@ python -u scripts/audit_mis_errors.py
 终端同时打印主要计数和最多6个实际文本案例，优先展示不同关系分类。
 接下来用这些固定案例核对MIS标注范围、类型和边界；本步骤不追加训练、
 不修改提示，不从dev拟合编辑策略。旧训练、预测、评分和审计文件保持原样。
+
+## 已回传的MIS关系分类与案例
+
+用户提供的服务器日志显示原审计复核通过，统计如下。这里仅列相对基线
+丢失的正确MIS和新增的MIS误报，不代表QLoRA的全部FN/FP：
+
+| 范围 / 错误视图 | 总数 | 无重叠 | 仅类型 | 仅边界 | 类型及边界 | 多重叠 | 格式失败 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| full_dev / lost_gold | 66 | 43 | 9 | 7 | 3 | 4 | 0 |
+| full_dev / introduced_vlm_fp | 120 | 45 | 35 | 28 | 6 | 6 | 0 |
+| dev_nonpanel / lost_gold | 59 | 37 | 8 | 7 | 3 | 4 | 0 |
+| dev_nonpanel / introduced_vlm_fp | 112 | 41 | 33 | 26 | 6 | 6 | 0 |
+
+完整dev丢失的MIS中43/66（65.2%）没有重叠预测；新增MIS误报中
+35/120（29.2%）与其他类型gold边界完全相同，另有28/120（23.3%）
+属于同类型的边界偏差。35个精确跨度的类型错误由PER->MIS 21个、
+ORG->MIS 10个、LOC->MIS 4个组成。完整dev唯一一条格式失败没有贡献
+这两组MIS错误，因此不能将该类退步归因于JSON格式问题。
+
+固定非面板案例提供以下可直接观察的证据：
+
+| source_id | 原词片段 | gold与两模型预测的差别 |
+| --- | --- | --- |
+| 1737 | Carrera Targa | gold与基线为MIS，QLoRA整条为空预测 |
+| 1616 | ISAC | gold与基线为MIS，QLoRA在同一跨度预测ORG |
+| 2122 | In May | QLoRA新增MIS，该跨度没有重叠gold；Yujoko仍正确预测PER |
+| 1877 | Garba pandal | gold与基线为LOC，QLoRA在同一跨度预测MIS |
+| 2607 | running man | gold为MIS，基线漏检，QLoRA补对 |
+| 5040 | Russians | gold与QLoRA为MIS，基线在同一跨度预测LOC |
+
+这些案例说明既有漏检，也有类型混淆和局部补对，尚不能证明图片导致
+退步。`In May`的错误还不能区分过度识别与原词索引偏移。
+source_id1877的`Indore`被原gold标为PER，而两模型均预测LOC，是需要
+人工核查的标注疑点；保持原gold计分，不据此修正标签、将gold当规则
+或推断全数据集标注质量。以上解释只使用已回传文本，没有检查对应图片。
+
+## 下一步：固定独立文本训练对照
+
+现有 `scripts/run_vlm_ner.py` 已支持 `--input-mode text`；
+`scripts/evaluate_vlm_ner.py` 从训练profile读取输入模式，也支持该控制。
+不需要修改旧训练或评估实现。此次只补齐原协议中尚缺的独立文本控制，
+用于判断当前多图输入相对文本是否有增益，不据MIS案例调整提示或采样。
+
+- 从同一原始Qwen2.5-VL-3B本地权重、seed1234新建adapter，不续训多图adapter。
+- 使用同一prepared manifest的5484条train、128条选轮面板和1372条dev，
+  保留全部原词、gold与空实体样本。唯一输入处理差异是不送入图片。
+- 保持原系统提示、语言LoRA、量化、优化器、样本顺序、batch1/累积8、
+  2轮与生成设置；正式训练共1372次优化器更新。相同样本和更新预算不等于相同FLOPs。
+- 与多图组一样在epoch0/1/2中按同一面板micro F1选最佳，平分保留较早轮次。
+  文本组需要自己的GPU smoke，不能使用多图组的smoke报告。
+- 训练结束先复现最佳面板，再一次性生成完整内部dev；比较整体及逐类
+  P/R/F1、格式失败率，同时报告full_dev、dev_panel和dev_nonpanel。
+  不按其中最高的分组结论挑选模型，不新增官方val/test访问。
+
+进入项目目录并激活原 `mner-vlm` 环境后，先单独运行冒烟：
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+python -u scripts/run_vlm_ner.py --stage smoke --input-mode text \
+  --output outputs_vlm_gold/mi_text_smoke
+python -m json.tool outputs_vlm_gold/mi_text_smoke/smoke_report.json
+```
+
+确认文本冒烟报告的passed为true，且profile.input_mode为text后，再运行
+独立的正式训练命令；冒烟脚本不会自动执行本阶段：
+
+```bash
+python -u scripts/run_vlm_ner.py --stage train --input-mode text \
+  --smoke-report outputs_vlm_gold/mi_text_smoke/smoke_report.json \
+  --output outputs_vlm_gold/mi_text_seed1234
+```
+
+该训练入口会核对smoke与正式训练的完整profile相同。正式训练完成后：
+
+```bash
+python -u scripts/evaluate_vlm_ner.py \
+  --run outputs_vlm_gold/mi_text_seed1234 \
+  --output outputs_vlm_gold/mi_text_seed1234_dev_evaluation
+```
+
+所有输出位于新目录。此次文本控制尚无真实GPU冒烟、训练或准确率结果。
+单种子开发集上的差值仅支持现有配置的比较，不能解释成AGVS组件贡献、
+统计显著性或独立测试泛化；内部dev已有的开发使用历史继续保留。
