@@ -37,6 +37,12 @@ F1=0.761301；原配图分别高约2.93和2.52个百分点。这支持当前adap
 对图文对应关系敏感，仍不能证明AGVS组件增益。当前基线与输入对照阶段
 结束，原none臂仍是这些候选中内部dev F1最高的模型。
 
+下一训练候选固定为25%的训练侧整组图像移除；验证和推理保留原配图，
+仍为同一两轮/seed1234/更新预算，从基础权重新建adapter。独立入口
+`scripts/run_vlm_image_dropout.py` 提供smoke/train/evaluate三个阶段，
+先通过其自己的GPU冒烟再训练。尚无真实性能结果，设置、执行与继续门槛见
+[固定训练图像移除协议](docs/vlm_image_dropout.md)。
+
 安装器要求数据盘至少20GiB可用。空间不足可先运行
 `python scripts/relocate_old_checkpoints.py` 查看旧权重迁移计划；它检查系统盘
 容量及文件系统，显式加 `--apply` 后才复制、校验并将原路径换成链接。
