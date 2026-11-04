@@ -30,8 +30,10 @@
 独立文本QLoRA对照也已完成，最佳面板复现通过：完整dev F1=0.781185，
 非面板F1=0.779835，格式失败3条。多图相对文本分别高约0.89和0.67个
 F1百分点，仍未超过原none臂基线；MIS在两组中都低于原基线。
-下一步用 `scripts/evaluate_vlm_no_images.py` 固定多图adapter做推理去图
-消融，先复现原图面板，再生成无图预测；该检查不追加训练。
+冻结多图adapter的去图推理也已完成：完整dev F1=0.775092，非面板
+F1=0.772858，原图分别高约1.50和1.37个百分点。下一步用
+`scripts/evaluate_vlm_mismatched_images.py` 做同图片数的固定错配图对照，
+三个条件只在同一可置换样本集合上比较；该检查不追加训练。
 
 安装器要求数据盘至少20GiB可用。空间不足可先运行
 `python scripts/relocate_old_checkpoints.py` 查看旧权重迁移计划；它检查系统盘
