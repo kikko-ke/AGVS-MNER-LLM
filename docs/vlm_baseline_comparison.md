@@ -650,3 +650,22 @@ LOC 的漏检和误报均增加。MIS 的误报下降幅度最大，同时净多
 
 数值来自 AutoDL 回传摘要，报告为
 `outputs_vlm_gold/bio_joint_recheck_v1/agvs_text_control/completed.json`。
+
+#### 两个冻结检查点的分组留出补充对照
+
+文本组第 4 轮的原生选轮 F1 复现为 0.797287。随后在同一批 1096 条
+分组留出样本上生成文本组预测，复用多图组第 11 轮已保存的原配图预测。
+两组按完整原词跨度评分。
+
+| 输入条件 | Precision | Recall | Micro-F1 |
+| --- | ---: | ---: | ---: |
+| 多图训练，原配图推理 | 0.80229746 | 0.82679128 | 0.81436023 |
+| 文本输入训练，文本输入推理 | 0.79227053 | 0.81744548 | 0.80466115 |
+
+多图组的 micro-F1 高 0.9699 个百分点，precision 和 recall 分别高
+1.0027 和 0.9346 个百分点。逐类 F1 差值（百分点）为 LOC +1.0110、
+MIS +1.9591、ORG +4.7129、PER −0.2171。该差值来自 seed 1234 单次成对
+对照。留出样本已用于 BIO 复验，此处归为同一留出上的补充结果。
+
+数值来自 AutoDL 回传摘要，报告为
+`outputs_vlm_gold/bio_joint_recheck_v1/agvs_text_control_holdout/evaluation_report.json`。
