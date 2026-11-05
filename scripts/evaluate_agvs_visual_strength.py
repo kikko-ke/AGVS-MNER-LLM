@@ -1,9 +1,12 @@
 """Probe the legacy AGVS visual coefficient with the frozen epoch-11 checkpoint."""
 from __future__ import annotations
 
+import argparse
 import json
+import math
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -27,8 +30,10 @@ def unit_strength(_model, args, kwargs):
 
 
 def comparison(legacy, unit):
-    matched_gain = unit['matched']['f1'] - legacy['matched']['f1']
-    shuffled_gain = unit['shuffled']['f1'] - legacy['shuffled']['f1']
+    legacy_matched = float(legacy['matched']['f1'])
+    unit_matched = float(unit['matched']['f1'])
+    matched_gain = unit_matched - legacy_matched
+    shuffled_gain = float(unit['shuffled']['f1']) - float(legacy['shuffled']['f1'])
     interaction = matched_gain - shuffled_gain
     return {
         'unit_minus_legacy_matched_f1': matched_gain,
@@ -36,7 +41,7 @@ def comparison(legacy, unit):
         'change_in_matched_minus_shuffled_f1': interaction,
         'minimum_matched_f1_gain': MIN_MATCHED_DELTA,
         'advance_to_training_pilot': (
-            unit['matched']['f1'] >= legacy['matched']['f1'] + MIN_MATCHED_DELTA and interaction > 0
+            unit_matched >= legacy_matched + MIN_MATCHED_DELTA and interaction > 0
         ),
     }
 
@@ -50,12 +55,73 @@ def evaluate_views(evaluator, datasets, mode, loader_options):
         progress = tqdm(DataLoader(dataset, **loader_options), desc=f'{mode}/{name}', unit='batch')
         with progress:
             metrics = evaluator._run_epoch(progress, training=False)
-        scores[name] = metrics
+        scores[name] = {**metrics, **{key: float(metrics[key])
+                                    for key in ('f1', 'precision', 'recall', 'accuracy', 'loss')}}
         print(f'\n=== {mode}/{name} ===\n{metrics["report"]}', flush=True)
     return scores
 
 
-def main():
+def print_summary(report, path):
+    print(json.dumps({
+        'samples': report['samples'],
+        'f1': {mode: {name: score['f1'] for name, score in values.items()}
+               for mode, values in report['metrics'].items()},
+        **report['comparison'], 'report': str(path.resolve()),
+    }, indent=2), flush=True)
+
+
+def recover_partial(path):
+    """Recover the four scores from the v1 write that stopped at the NumPy gate."""
+    original = path.read_bytes()
+    text = original.decode('utf-8').rstrip()
+    try:
+        report = json.loads(text)
+    except json.JSONDecodeError:
+        if not text.endswith('"advance_to_training_pilot":'):
+            raise ValueError('The report does not end at the known serialization failure')
+        report = json.loads(text + ' null}}')
+    else:
+        print_summary(report, path)
+        return
+
+    if (report.get('schema_version') != 'agvs-visual-strength-dev-probe-v1'
+            or report.get('best_epoch') != 11 or report.get('samples') != 1372
+            or report.get('shuffle_seed') != SHUFFLE_SEED
+            or report.get('reassigned_donors') != 1372
+            or report.get('legacy_reproduction') != {'expected_f1': REFERENCE_F1, 'passed': True}):
+        raise ValueError('The partial report does not match the fixed visual-strength probe')
+    legacy = report['metrics']['legacy']
+    unit = report['metrics']['unit_if_image_present']
+    if (any(not 0 <= scores[name]['f1'] <= 1 for scores in (legacy, unit) for name in REFERENCE_F1)
+            or any(abs(legacy[name]['f1'] - expected) > REPRODUCTION_TOLERANCE
+                   for name, expected in REFERENCE_F1.items())):
+        raise ValueError('The saved F1 values fail the reproduction check')
+    delta = comparison(legacy, unit)
+    for key, value in delta.items():
+        if key != 'advance_to_training_pilot' and not math.isclose(
+                report['comparison'][key], value, rel_tol=0, abs_tol=1e-12):
+            raise ValueError(f'Saved comparison differs from the four F1 values: {key}')
+
+    backup = path.with_suffix('.partial.json')
+    report['comparison'] = delta
+    report['recovered_from_partial'] = {'path': str(backup.resolve()), 'sha256': sha256_file(path)}
+    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
+    if backup.exists():
+        if backup.read_bytes() != original:
+            raise ValueError(f'Existing partial backup differs: {backup}')
+    else:
+        with backup.open('xb') as destination:
+            destination.write(original)
+    with TemporaryDirectory(dir=path.parent, prefix='.agvs-strength-recovery-') as directory:
+        recovered = Path(directory) / path.name
+        recovered.write_text(payload, encoding='utf-8')
+        if path.read_bytes() != original:
+            raise ValueError('The source report changed during recovery')
+        recovered.replace(path)
+    print_summary(report, path)
+
+
+def evaluate():
     if OUTPUT.exists():
         raise FileExistsError(f'Preserve the existing result: {OUTPUT}')
     runtime = recheck.baseline.check_baseline_runtime()
@@ -122,15 +188,19 @@ def main():
         'input_sha256': inputs, 'optimizer_steps': 0, 'official_val_or_test_read': False,
         'grouped_holdout_scored': False,
     }
+    payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
     with OUTPUT.open('x', encoding='utf-8') as destination:
-        json.dump(report, destination, indent=2)
-        destination.write('\n')
-    print(json.dumps({
-        'samples': len(dataset),
-        'f1': {mode: {name: score['f1'] for name, score in values.items()}
-               for mode, values in report['metrics'].items()},
-        **delta, 'report': str(OUTPUT.resolve()),
-    }, indent=2), flush=True)
+        destination.write(payload)
+    print_summary(report, OUTPUT)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--recover-partial', action='store_true')
+    if parser.parse_args().recover_partial:
+        recover_partial(OUTPUT)
+    else:
+        evaluate()
 
 
 if __name__ == '__main__':
