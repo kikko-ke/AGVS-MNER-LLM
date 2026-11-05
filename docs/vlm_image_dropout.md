@@ -103,6 +103,6 @@ python -u scripts/run_vlm_image_dropout.py --stage evaluate
 按预先固定的0.807965继续门槛收束该候选，保留原none臂为主对照。
 
 评估报告路径在退出清理异常之前已打印。异常发生于Python和Conda移除
-`/tmp`临时目录时，日志显示`Stale file handle`。本地记录依据服务器终端
-输出，服务器产物可通过报告中的`panel_reproduction.passed`和
-`dev_predictions_sha256`核验。
+`/tmp`临时目录时，日志显示`Stale file handle`。用户随后在服务器读回报告，
+确认`panel_reproduction.passed`为真且预测文件SHA256与报告一致，校验
+输出完整dev F1为0.7900337399429016。
