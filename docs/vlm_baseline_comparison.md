@@ -738,3 +738,24 @@ Qwen 特征臂相对原多图 AGVS 高 0.7254 个百分点，相对 BERT 特征�
 
 数值来自 AutoDL 回传摘要，报告为
 `outputs_vlm_gold/bio_joint_recheck_v1/agvs_llm_word_feature_pilot_v1/dev_fusion_report.json`。
+
+#### 冻结 Qwen 逐词特征融合的分组留出复验
+
+在 1096 条已用于前序分析的分组留出样本上复用第 11 轮 AGVS、
+两个已训练标签头和开发集选出的系数。三臂均保留 AGVS 的原配图。
+评估入口先重放标签头的开发集逐词得分，并核对原 AGVS 的留出预测。
+
+| 方法 | 留出完整跨度 Micro-F1 | 相对原 AGVS（百分点） |
+| --- | ---: | ---: |
+| 原多图 AGVS | 0.81436023 | 0 |
+| AGVS + BERT 逐词特征标签头 | 0.81972265 | +0.5362 |
+| AGVS + Qwen 逐词特征标签头 | 0.82497693 | +1.0617 |
+
+Qwen 特征臂相对同结构 BERT 特征臂增加 0.5254 个百分点。
+相对两项对照均达到 0.003 的复验门槛，
+`passes_grouped_holdout_gate=true`。本结果支持单种子、单数据集条件下
+冻结 Qwen 逐词特征的增量。留出集已有开发历史，跨种子及新样本上的
+表现仍待验证。
+
+数值来自 AutoDL 回传摘要，报告为
+`outputs_vlm_gold/bio_joint_recheck_v1/agvs_llm_word_feature_pilot_v1/frozen_holdout_evaluation/evaluation_report.json`。
