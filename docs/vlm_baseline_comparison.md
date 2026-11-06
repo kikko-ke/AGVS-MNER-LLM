@@ -759,3 +759,25 @@ Qwen 特征臂相对同结构 BERT 特征臂增加 0.5254 个百分点。
 
 数值来自 AutoDL 回传摘要，报告为
 `outputs_vlm_gold/bio_joint_recheck_v1/agvs_llm_word_feature_pilot_v1/frozen_holdout_evaluation/evaluation_report.json`。
+
+#### 冻结融合系数的三种子配对复验
+
+种子 42 和 2026 复用此前各自训练的多图 AGVS 检查点，只重新训练同种子
+的 BERT 与 Qwen 标签头。三组种子均使用原 4388 条训练样本及 1096 条分组
+留出，融合系数固定为 seed 1234 开发集选出的 BERT 0.5、Qwen 1.0。
+种子 1234 复用上节结果，重新核对预测与评分。
+
+| Seed | 原 AGVS Micro-F1 | AGVS + BERT Micro-F1 | AGVS + Qwen Micro-F1 | Qwen 减原 AGVS（百分点） | Qwen 减 BERT 臂（百分点） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1234 | 0.81436023 | 0.81972265 | 0.82497693 | +1.0617 | +0.5254 |
+| 42 | 0.82008626 | 0.82552404 | 0.82920792 | +0.9122 | +0.3684 |
+| 2026 | 0.80821078 | 0.81809788 | 0.81944017 | +1.1229 | +0.1342 |
+| 均值 | 0.81421909 | 0.82111486 | 0.82454167 | +1.0323 | +0.3427 |
+
+Qwen 特征臂在三个种子均高于两项对照，两组配对差值的样本标准差分别为
+0.1084 和 0.1969 个百分点。种子 1234 和 42 相对两项对照均达到 +0.003
+的阈值，种子 2026 相对 BERT 特征臂的差值为 +0.0013423。以上结果描述
+同一已评分留出上的跨种子稳定性，新样本上的增益仍待验证。
+
+数值来自 AutoDL 回传摘要，汇总报告为
+`outputs_vlm_gold/bio_joint_recheck_v1/agvs_llm_word_feature_pilot_v1/paired_seed_holdout_v1/evaluation/evaluation_report.json`。
