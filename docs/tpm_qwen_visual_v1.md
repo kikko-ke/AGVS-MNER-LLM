@@ -39,6 +39,8 @@ Qwen2.5-VL-3B-Instruct 保持 4-bit NF4、BF16 计算，全部冻结，不做 Lo
 
 最多使用记录中的 4 张图片，不主动缩减张数。按照原图像审计跳过缺失/损坏图片，保留其余有效图片的相对顺序；每条记录的使用槽位、跳过槽位和数量都保存。全无有效图片的记录走文本输入，并明确计入 fallback 数量。
 
+对于能解码但任一边小于 `patch_size * merge_size`（本模型为 28 像素）的图片，先在内存中按原比例放大，整数向上取整，直到两边均至少为 28；然后交给原生 processor 处理。其他图片的像素输入保持不变。原图片文件不改写，小图不被丢弃；`resized_images` 记录原尺寸、放大后尺寸和对应图片槽位，特征 summary 汇总放大数量。
+
 ## AutoDL 执行
 
 继续使用现有 Conda `base` 与 `/root/autodl-tmp/envs/mner-vlm`，脚本不安装或升级环境。
@@ -116,6 +118,34 @@ bash scripts/run_tpm_qwen_visual_v1.sh smoke
 ```
 
 另外可设置 `TPM_VISUAL_MIN_PIXELS`、`TPM_VISUAL_MAX_INPUT_TOKENS`、`TPM_VISUAL_SHARD_SIZE`、`TPM_CONDA_BIN`、`TPM_VLM_ENV`、`CUDA_VISIBLE_DEVICES`。改变图像预算、实现或分块配置后必须使用新目录。模型和数据位置沿用来源协议，不在新实验里另换模型。
+
+### 恢复 `height:21 ... factor:28` 报错
+
+这个错误发生在原生 Qwen processor 的尺寸检查，尚未进入该样本的模型前向；增加 `min_pixels` 不能绕过原始输入的短边检查。小图放大修复用真实 Transformers 4.51.3 processor 复现和验证，涵盖 190×21、21×190 和 7×7。
+
+若已经用修复前的版本运行了一部分，更新以下路径并换一个新的图文实验目录。改了预处理实现后，旧协议的代码哈希会不匹配，不能直接在旧目录续跑；旧图文缓存保留，修复后的图文特征重新提取，TPM-MI 和纯文本 Qwen 结果仍直接复用：
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM &&
+git fetch origin &&
+git restore --source=origin/codex/tpm-mi-llm-20261117 --worktree -- \
+    modules/tpm_qwen_visual_v1 \
+    scripts/run_tpm_qwen_visual_v1.py \
+    scripts/run_tpm_qwen_visual_v1.sh \
+    docs/tpm_qwen_visual_v1.md &&
+export TPM_SOURCE_RUN=outputs_vlm_gold/tpm_mi_llm_v1 &&
+export TPM_VISUAL_RUN_DIR=outputs_vlm_gold/tpm_qwen_visual_min28_v1 &&
+bash scripts/run_tpm_qwen_visual_v1.sh smoke
+```
+
+smoke 通过后，在同一终端中运行：
+
+```bash
+nohup bash scripts/run_tpm_qwen_visual_v1.sh all > tpm_qwen_visual_min28_v1.log 2>&1 &
+tail -f tpm_qwen_visual_min28_v1.log
+```
+
+新报告写入 `outputs_vlm_gold/tpm_qwen_visual_min28_v1/evaluation/comparison_report.json`。不要沿用旧提交 `fd39af8` 作为此次更新的 restore 来源，它不包含小图修复。
 
 ## 查看结果
 

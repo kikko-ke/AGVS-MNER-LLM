@@ -15,6 +15,30 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_END = "<|vision_end|>"
 
 
+def open_qwen_image(path, factor):
+    """Retain tiny images by upscaling their short edge before native processing.
+
+    Transformers 4.51.3 smart_resize rejects an edge below patch_size *
+    merge_size before applying min_pixels. Images already meeting that bound
+    are returned unchanged; source image files are never rewritten.
+    """
+    from PIL import Image
+    if factor < 1:
+        raise ValueError("The Qwen image size factor must be positive")
+    image = open_rgb(path)
+    width, height = image.size
+    shortest = min(width, height)
+    if shortest >= factor:
+        return image, None
+    # Integer ceiling keeps BOTH edges above the bound, including portrait images.
+    target = tuple((edge * factor + shortest - 1) // shortest for edge in (width, height))
+    try:
+        resized = image.resize(target, Image.Resampling.BICUBIC)
+    finally:
+        image.close()
+    return resized, {"original_size": [width, height], "input_size": list(target)}
+
+
 def prepare_input(row, processor, audit, maximum):
     """Align using the verified text-token suffix, NOT expanded-placeholder offsets.
 
@@ -30,7 +54,7 @@ def prepare_input(row, processor, audit, maximum):
     ids = plain["input_ids"]
     if not ids or len(ids) > 512:
         raise ValueError(f"Original text must contain 1..512 subtokens: {row['source_id']}")
-    images, slots, missing = [], [], []
+    images, slots, missing, resized = [], [], [], []
     try:
         for slot, name in enumerate(row["images"]):
             info = audit[name]
@@ -38,11 +62,20 @@ def prepare_input(row, processor, audit, maximum):
                 missing.append({"slot": slot, "name": name})
                 continue
             # A previously valid file becoming unreadable is an error, not a new fallback.
-            images.append(open_rgb(Path(info["path"])))
+            factor = processor.image_processor.patch_size * processor.image_processor.merge_size
+            image, adjustment = open_qwen_image(Path(info["path"]), factor)
+            images.append(image)
+            if adjustment is not None:
+                resized.append({"slot": slot, "name": name, **adjustment})
             slots.append(slot)
         prefix = (VISION_START + IMAGE_PAD + VISION_END) * len(images)
-        batch = processor(text=[prefix + text], return_tensors="pt", padding=False,
-                          truncation=False, **({"images": images} if images else {}))
+        try:
+            batch = processor(text=[prefix + text], return_tensors="pt", padding=False,
+                              truncation=False, **({"images": images} if images else {}))
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"Qwen preprocessing failed for {row['source_id']}; "
+                f"used_slots={slots}, resized_images={resized}: {error}") from error
         observed = batch["input_ids"][0].tolist()
         if len(observed) > maximum:
             raise ValueError(
@@ -64,6 +97,7 @@ def prepare_input(row, processor, audit, maximum):
                 raise ValueError("Expanded image tokens and image grids disagree")
         usage = {"source_id": row["source_id"], "original_images": len(row["images"]),
                  "valid_images": len(images), "used_slots": slots, "missing": missing,
+                 "resized_images": resized,
                  "sequence_tokens": len(observed), "text_tokens": len(ids),
                  "prefix_tokens": prefix_tokens}
         # Metadata is never forwarded to Qwen, especially offset_mapping or gold labels.
@@ -109,6 +143,8 @@ def usage_summary(usage):
             "valid_image_count_histogram": dict(sorted(Counter(str(x["valid_images"]) for x in usage).items())),
             "text_only_fallback_samples": sum(x["valid_images"] == 0 for x in usage),
             "skipped_image_slots": sum(len(x["missing"]) for x in usage),
+            "resized_image_slots": sum(len(x.get("resized_images", [])) for x in usage),
+            "samples_with_resized_images": sum(bool(x.get("resized_images")) for x in usage),
             "max_sequence_tokens": max((x["sequence_tokens"] for x in usage), default=0)}
 
 

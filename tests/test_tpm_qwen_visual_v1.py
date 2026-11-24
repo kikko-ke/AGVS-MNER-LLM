@@ -20,7 +20,7 @@ def native_processor():
         vocab_size=300, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), special_tokens=special))
     fast = Qwen2TokenizerFast(tokenizer_object=tokenizer, eos_token=special[0], pad_token=special[0])
     processor = Qwen2_5_VLProcessor(
-        image_processor=Qwen2VLImageProcessor(min_pixels=3136, max_pixels=3136), tokenizer=fast)
+        image_processor=Qwen2VLImageProcessor(min_pixels=3136, max_pixels=200704), tokenizer=fast)
     return processor
 
 
@@ -50,6 +50,48 @@ def test_native_processor_expansion_keeps_word_suffix_and_all_valid_images(tmp_p
     assert set(inputs) == {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
     assert inputs["input_ids"][0, :min(positions)].eq(
         native_processor.tokenizer.convert_tokens_to_ids(features.IMAGE_PAD)).any()
+
+
+@pytest.mark.parametrize("size,expected", [((190, 21), (254, 28)),
+                                        ((21, 190), (28, 254)),
+                                        ((7, 7), (28, 28))])
+def test_tiny_images_reproduce_native_error_then_are_retained(tmp_path, native_processor, size, expected):
+    from PIL import Image
+    path = tmp_path / "tiny.png"
+    Image.new("RGB", size, "green").save(path)
+    original_bytes = path.read_bytes()
+    # Reproduce the exact AutoDL smart_resize failure before testing the repair.
+    with Image.open(path) as image:
+        with pytest.raises(ValueError, match="larger than factor:28"):
+            native_processor.image_processor(images=image, return_tensors="pt")
+    audit = {"tiny.png": {"path": str(path), "valid": True}}
+    row = {"source_id": "train:739", "tokens": ["New", "York"], "images": ["tiny.png"]}
+    inputs, positions, usage = features.prepare_input(row, native_processor, audit, 2048)
+    assert len(inputs["image_grid_thw"]) == usage["valid_images"] == 1
+    assert torch.isfinite(inputs["pixel_values"]).all() and min(positions) > 0
+    assert usage["used_slots"] == [0] and usage["missing"] == []
+    assert usage["resized_images"] == [{"slot": 0, "name": "tiny.png",
+                                        "original_size": list(size), "input_size": list(expected)}]
+    summary = features.usage_summary([usage])
+    assert summary["resized_image_slots"] == summary["samples_with_resized_images"] == 1
+    assert path.read_bytes() == original_bytes
+
+
+def test_regular_images_produce_exactly_the_original_processor_inputs(tmp_path, native_processor):
+    audit = make_images(tmp_path)
+    row = {"source_id": "train:0", "tokens": ["New", "York"], "images": ["first.png"]}
+    image, adjustment = features.open_qwen_image(tmp_path / "first.png", 28)
+    try:
+        assert image.size == (56, 56) and adjustment is None
+        expected = native_processor(text=[features.VISION_START + features.IMAGE_PAD +
+                                          features.VISION_END + "New York"],
+                                    images=[image], return_tensors="pt", padding=False, truncation=False)
+    finally:
+        image.close()
+    observed, _, usage = features.prepare_input(row, native_processor, audit, 2048)
+    for key, values in observed.items():
+        torch.testing.assert_close(values, expected[key], atol=0, rtol=0)
+    assert usage["resized_images"] == []
 
 
 def test_missing_images_have_explicit_text_fallback_and_budget_is_never_truncated(tmp_path, native_processor):
