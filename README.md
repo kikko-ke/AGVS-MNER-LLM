@@ -1,5 +1,7 @@
 # AGVS-MNER-LLM
 
+新增实验：[TPM-MI 的 Qwen 纯文本 / 图文特征配对对照](docs/tpm_qwen_visual_v1.md)。复用已有 TPM-MI 结果，新增原始多图条件下的冻结 Qwen 特征与同结构辅助头，可直接在 AutoDL 运行。
+
 面向多图像多模态命名实体识别（MNER）的 LLM 增强实验项目。学生保留 AGVS-MNER 的多图顺序建模、全局视觉锚点、patch 选择与 CRF 解码，并以严格验证集审计决定 LLM 的使用方式。
 
 ## 当前测试结论：没有两数据集一致增益
