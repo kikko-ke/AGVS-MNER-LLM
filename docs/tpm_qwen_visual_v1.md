@@ -49,16 +49,30 @@ Qwen2.5-VL-3B-Instruct 保持 4-bit NF4、BF16 计算，全部冻结，不做 Lo
 unzip -o /root/autodl-tmp/tpm_qwen_visual_v1_update.zip -d /root/autodl-tmp/AGVS-MNER-LLM
 ```
 
-如果本更新已经推送至 GitHub，也可以从包含它的 `codex/tpm-mi-llm-20261117` 分支更新代码：
+如果旧实验是通过更新包安装的，Git 会把旧 TPM-MI 文件视为未跟踪文件，直接切换分支可能报 `untracked working tree files would be overwritten`。这种情况下保留当前分支，只从远程分支定向安装本次新增模块和入口；不需要移动或删除报错列表中的旧代码：
 
 ```bash
-cd /root/autodl-tmp/AGVS-MNER-LLM
-git fetch origin
-git switch codex/tpm-mi-llm-20261117
+cd /root/autodl-tmp/AGVS-MNER-LLM &&
+git fetch origin &&
+git restore --source=origin/codex/tpm-mi-llm-20261117 --worktree -- \
+    modules/tpm_qwen_visual_v1 \
+    scripts/run_tpm_qwen_visual_v1.py \
+    scripts/run_tpm_qwen_visual_v1.sh \
+    docs/tpm_qwen_visual_v1.md
+```
+
+这个命令只更新上面列出的路径，不修改 Git 索引、当前分支、`modules/tpm_llm_v1`、原实验入口、数据、模型和已有结果。新入口仍会核验原协议中的代码与文件哈希，分支名称不参与原协议核验。
+
+如果原代码本来就由 Git 管理且没有切换冲突，也可以切到包含本更新的分支。下面用 `&&` 保证某一步失败后不会继续执行后续步骤：
+
+```bash
+cd /root/autodl-tmp/AGVS-MNER-LLM &&
+git fetch origin &&
+git switch codex/tpm-mi-llm-20261117 &&
 git pull --ff-only origin codex/tpm-mi-llm-20261117
 ```
 
-两种更新方式任选其一，随后执行：
+选择适合现有目录的更新方式，成功后执行：
 
 ```bash
 cd /root/autodl-tmp/AGVS-MNER-LLM
